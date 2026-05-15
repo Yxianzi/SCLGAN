@@ -1,0 +1,4 @@
+__pycache__/
+# Datasets
+/datasets/
+/SCLGAN1-clean/datasets/
