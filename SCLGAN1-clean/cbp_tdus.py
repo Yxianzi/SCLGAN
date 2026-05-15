@@ -1022,7 +1022,7 @@ def build_cbp_tdus_dataset(
     selected_scores = score_all[selected_indices]
     score_min = selected_scores.min()
     score_max = selected_scores.max()
-    if active_gen_reliability:
+    if active_gen_reliability and gen_rel_mode == "fusion":
         normalized_score = selected_scores.clamp(0.0, 1.0)
     elif selected_scores.numel() == 1 or (score_max - score_min).abs() < 1e-8:
         normalized_score = torch.ones_like(selected_scores)

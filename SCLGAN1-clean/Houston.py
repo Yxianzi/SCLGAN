@@ -94,6 +94,7 @@ group_model.add_argument('--lambda_candidate_gen_cons', type=float, default=0.00
 group_model.add_argument('--candidate_gen_cons_max_loss', type=float, default=2.0)
 group_model.add_argument('--use_reliability_tce', type=int, default=1)
 group_model.add_argument('--lambda_tgt_ce', type=float, default=0.05)
+group_model.add_argument('--verbose_tdus_log', type=int, default=1)
 
 args = parser.parse_args()
 print(args)
@@ -292,6 +293,7 @@ for iDataSet in range(nDataSet):
     for epoch in range(1, epochs + 1):
         LEARNING_RATE = lr / math.pow((1 + 10 * (epoch - 1) / epochs), 0.75)
         print('learning rate{: .4f}'.format(LEARNING_RATE))
+        tdus_refreshed = False
         optimizer = torch.optim.SGD([
             {'params': feature_encoder.mp.parameters(), 'lr': LEARNING_RATE},
             {'params': feature_encoder.Spatial_Weight_1.parameters(), 'lr': LEARNING_RATE},
@@ -367,25 +369,27 @@ for iDataSet in range(nDataSet):
                 gen_min_prob_consistency=args.gen_min_prob_consistency,
                 gen_min_quality=args.gen_min_quality,
             )
+            tdus_refreshed = True
 
-            if tdus_info.get("spatial_status", "") in ("disabled_missing_coordinates", "disabled_invalid_coordinates"):
+            if bool(args.verbose_tdus_log) and tdus_info.get("spatial_status", "") in ("disabled_missing_coordinates", "disabled_invalid_coordinates"):
                 print("[SC-DAPT-TDUS] spatial disabled due to missing coordinates:", tdus_info["spatial_status"])
 
             if tdus_info["num_selected"] == 0:
                 labeled_loader = None
-                print(
-                    "[SC-DAPT-TDUS] Skip pseudo-label fine-tuning: "
-                    f"reason={tdus_info['skip_reason']}, "
-                    f"core_hist={tdus_info['class_hist']}, "
-                    f"pre_core_hist={tdus_info.get('pre_core_hist', [])}, "
-                    f"coverage={tdus_info['coverage']}, "
-                    f"max_prior={tdus_info['max_prior']:.4f}, "
-                    f"mixed_prior={['{:.3f}'.format(x) for x in tdus_info['mixed_prior']]}, "
-                    f"quota={tdus_info['quota_per_class']}, "
-                    f"score_threshold={tdus_info['score_threshold']:.4f}, "
-                    f"min_class_count={tdus_info['min_class_count']}, "
-                    f"spa_agree={tdus_info['mean_spatial_agree']:.4f}"
-                )
+                if bool(args.verbose_tdus_log):
+                    print(
+                        "[SC-DAPT-TDUS] Skip pseudo-label fine-tuning: "
+                        f"reason={tdus_info['skip_reason']}, "
+                        f"core_hist={tdus_info['class_hist']}, "
+                        f"pre_core_hist={tdus_info.get('pre_core_hist', [])}, "
+                        f"coverage={tdus_info['coverage']}, "
+                        f"max_prior={tdus_info['max_prior']:.4f}, "
+                        f"mixed_prior={['{:.3f}'.format(x) for x in tdus_info['mixed_prior']]}, "
+                        f"quota={tdus_info['quota_per_class']}, "
+                        f"score_threshold={tdus_info['score_threshold']:.4f}, "
+                        f"min_class_count={tdus_info['min_class_count']}, "
+                        f"spa_agree={tdus_info['mean_spatial_agree']:.4f}"
+                    )
             else:
                 labeled_loader = DataLoader(
                     labeled_dataset,
@@ -408,29 +412,30 @@ for iDataSet in range(nDataSet):
             else:
                 candidate_loader = None
 
-            print(
-                "[SC-DAPT-TDUS][{}] epoch={}, selected={}, core_hist={}, pre_core_hist={}, coverage={}, pred_prior={}, mixed_prior={}, quota_per_class={}, max_prior={:.4f}, score_threshold={:.4f}, min_class_count={}, spa_agree={:.4f}, skip_reason={}, conf={:.4f}, ent={:.4f}, proto_dist={:.4f}, agree={:.4f}, score={:.4f}".format(
-                    dataset_name,
-                    epoch,
-                    tdus_info["num_selected"],
-                    tdus_info["class_hist"],
-                    tdus_info.get("pre_core_hist", []),
-                    tdus_info["coverage"],
-                    ["{:.3f}".format(x) for x in tdus_info["pred_prior"]],
-                    ["{:.3f}".format(x) for x in tdus_info["mixed_prior"]],
-                    tdus_info["quota_per_class"],
-                    tdus_info["max_prior"],
-                    tdus_info["score_threshold"],
-                    tdus_info["min_class_count"],
-                    tdus_info["mean_spatial_agree"],
-                    tdus_info["skip_reason"],
-                    tdus_info["mean_conf"],
-                    tdus_info["mean_entropy"],
-                    tdus_info["mean_proto_dist"],
-                    tdus_info["mean_agree"],
-                    tdus_info["mean_score"],
+            if bool(args.verbose_tdus_log):
+                print(
+                    "[SC-DAPT-TDUS][{}] epoch={}, selected={}, core_hist={}, pre_core_hist={}, coverage={}, pred_prior={}, mixed_prior={}, quota_per_class={}, max_prior={:.4f}, score_threshold={:.4f}, min_class_count={}, spa_agree={:.4f}, skip_reason={}, conf={:.4f}, ent={:.4f}, proto_dist={:.4f}, agree={:.4f}, score={:.4f}".format(
+                        dataset_name,
+                        epoch,
+                        tdus_info["num_selected"],
+                        tdus_info["class_hist"],
+                        tdus_info.get("pre_core_hist", []),
+                        tdus_info["coverage"],
+                        ["{:.3f}".format(x) for x in tdus_info["pred_prior"]],
+                        ["{:.3f}".format(x) for x in tdus_info["mixed_prior"]],
+                        tdus_info["quota_per_class"],
+                        tdus_info["max_prior"],
+                        tdus_info["score_threshold"],
+                        tdus_info["min_class_count"],
+                        tdus_info["mean_spatial_agree"],
+                        tdus_info["skip_reason"],
+                        tdus_info["mean_conf"],
+                        tdus_info["mean_entropy"],
+                        tdus_info["mean_proto_dist"],
+                        tdus_info["mean_agree"],
+                        tdus_info["mean_score"],
+                    )
                 )
-            )
             # print("开始主动学习")
             # 评估未标注数据的预测概率
 
@@ -870,121 +875,122 @@ for iDataSet in range(nDataSet):
                 .format(epoch, cls_loss.item(), lmmd_loss.item(), domain_similar_loss.item(), contrastive_loss_s.item(),
                         contrastive_loss_t.item(),
                         total_hit / size,  loss_min.item(),loss_correlation_alignment_loss.item(), loss.item()))
-        print(
-            "[CON] raw_s={:.6f}, raw_t={:.6f}, lambda_s={:.4f}, lambda_t={:.4f}, weighted_s={:.6f}, weighted_t={:.6f}".format(
-                contrastive_loss_s.item(),
-                contrastive_loss_t.item(),
-                args.lambda_con_s,
-                args.lambda_con_t,
-                weighted_con_s.item(),
-                weighted_con_t.item(),
-            )
-        )
-        print(
-            "[GEN-REL] mean={:.4f}, min={:.4f}, max={:.4f}, agree_mean={:.4f}, prob_cons_mean={:.4f}, feat_cons_mean={:.4f}, gen_quality_mean={:.4f}".format(
-                tdus_info.get("gen_rel_mean", 0.0),
-                tdus_info.get("gen_rel_min", 0.0),
-                tdus_info.get("gen_rel_max", 0.0),
-                tdus_info.get("gen_agree_mean", 0.0),
-                tdus_info.get("gen_prob_cons_mean", 0.0),
-                tdus_info.get("gen_feat_cons_mean", 0.0),
-                tdus_info.get("gen_quality_mean", 0.0),
-            )
-        )
-        print(
-            "[GEN-REL] low_agree={}, low_prob_cons={}, low_quality={}".format(
-                tdus_info.get("low_agree", 0),
-                tdus_info.get("low_prob_cons", 0),
-                tdus_info.get("low_quality", 0),
-            )
-        )
-        print(
-            "[TDUS] base_score_mean={:.4f}, final_score_mean={:.4f}, gen_rel_weight={:.4f}".format(
-                tdus_info.get("base_score_mean", 0.0),
-                tdus_info.get("final_score_mean", 0.0),
-                tdus_info.get("gen_rel_weight", 0.0),
-            )
-        )
-        print(
-            "[GEN-GATE] core_pool_global={}, core_low_agree_global={}, core_low_prob_cons_global={}, core_low_quality_global={}, downgraded_global={}".format(
-                tdus_info.get("core_before_gen_gate", 0),
-                tdus_info.get("core_low_agree", 0),
-                tdus_info.get("core_low_prob_cons", 0),
-                tdus_info.get("core_low_quality", 0),
-                tdus_info.get("downgraded_to_candidate", 0),
-            )
-        )
-        print(
-            "[TDUS] core_before_gen_gate={}, core_after_gen_gate={}, downgraded_to_candidate={}".format(
-                tdus_info.get("core_before_gen_gate", 0),
-                tdus_info.get("core_after_gen_gate", 0),
-                tdus_info.get("downgraded_to_candidate", 0),
-            )
-        )
-        print(
-            "[ETDUS] core_global={}, candidate_global={}, unselected={}, pre_core_hist={}, core_hist={}, candidate_hist={}, coverage={}, missing_core_classes={}, missing_candidate_classes={}".format(
-                tdus_info.get("num_core", tdus_info.get("num_selected", 0)),
-                tdus_info.get("num_candidate", 0),
-                tdus_info.get("num_unselected", 0),
-                tdus_info.get("pre_core_hist", [0 for _ in range(CLASS_NUM)]),
-                tdus_info.get("core_hist", tdus_info.get("class_hist", [0 for _ in range(CLASS_NUM)])),
-                tdus_info.get("candidate_hist", [0 for _ in range(CLASS_NUM)]),
-                tdus_info.get("coverage", 0),
-                tdus_info.get("missing_core_classes", []),
-                tdus_info.get("missing_candidate_classes", []),
-            )
-        )
-        if args.align_type == "tg_ccal":
+        if tdus_refreshed and bool(args.verbose_tdus_log):
             print(
-                "[TG-CCAL] epoch={}, core_global={}, core_batch={}, effective_ratio={:.4f}, valid_classes={}, skipped_classes={}, loss={:.6f}, raw_loss={:.6f}, mean={:.6f}, cov={:.6f}, proto={:.6f}, class_counts_batch={}".format(
-                    epoch,
-                    tgccal_epoch_info.get("core_global", 0),
-                    tgccal_epoch_info.get("core_batch", 0),
-                    tgccal_epoch_info.get("effective_ratio", 0.0),
-                    tgccal_epoch_info["valid_classes"],
-                    tgccal_epoch_info.get("skipped_classes", []),
-                    tgccal_epoch_info.get("weighted_loss", 0.0),
-                    tgccal_epoch_info.get("loss", 0.0),
-                    tgccal_epoch_info["mean"],
-                    tgccal_epoch_info["cov"],
-                    tgccal_epoch_info["proto"],
-                    tgccal_epoch_info["class_counts"],
+                "[CON] raw_s={:.6f}, raw_t={:.6f}, lambda_s={:.4f}, lambda_t={:.4f}, weighted_s={:.6f}, weighted_t={:.6f}".format(
+                    contrastive_loss_s.item(),
+                    contrastive_loss_t.item(),
+                    args.lambda_con_s,
+                    args.lambda_con_t,
+                    weighted_con_s.item(),
+                    weighted_con_t.item(),
                 )
             )
-            if tgccal_epoch_info.get("skip_reason", ""):
-                print("[TG-CCAL][SKIP] reason={}".format(tgccal_epoch_info["skip_reason"]))
-        candidate_avg_loss = candidate_epoch_loss / max(1, candidate_epoch_steps)
-        print(
-            "[CAND-KL] candidate_global={}, candidate_used={}, candidate_batch={}, loss={:.6f}, weight={:.6f}".format(
-                tdus_info.get("num_candidate", 0),
-                candidate_epoch_count,
-                candidate_batch_last,
-                candidate_avg_loss,
-                args.candidate_consistency_weight if bool(args.use_candidate_consistency) else 0.0,
+            print(
+                "[GEN-REL] mean={:.4f}, min={:.4f}, max={:.4f}, agree_mean={:.4f}, prob_cons_mean={:.4f}, feat_cons_mean={:.4f}, gen_quality_mean={:.4f}".format(
+                    tdus_info.get("gen_rel_mean", 0.0),
+                    tdus_info.get("gen_rel_min", 0.0),
+                    tdus_info.get("gen_rel_max", 0.0),
+                    tdus_info.get("gen_agree_mean", 0.0),
+                    tdus_info.get("gen_prob_cons_mean", 0.0),
+                    tdus_info.get("gen_feat_cons_mean", 0.0),
+                    tdus_info.get("gen_quality_mean", 0.0),
+                )
             )
-        )
-        if candidate_skip_epoch:
-            print("[CAND-KL][SKIP] {}".format(candidate_skip_reason))
-        tgt_ce_avg_raw = tgt_ce_epoch_raw / max(1, tgt_ce_epoch_steps)
-        tgt_ce_avg_weighted = tgt_ce_epoch_weighted / max(1, tgt_ce_epoch_steps)
-        print(
-            "[TGT-CE] core={}, raw={:.6f}, weighted={:.6f}".format(
-                tgt_ce_epoch_count,
-                tgt_ce_avg_raw,
-                tgt_ce_avg_weighted,
+            print(
+                "[GEN-REL] low_agree={}, low_prob_cons={}, low_quality={}".format(
+                    tdus_info.get("low_agree", 0),
+                    tdus_info.get("low_prob_cons", 0),
+                    tdus_info.get("low_quality", 0),
+                )
             )
-        )
-        candidate_gen_avg_loss = candidate_gen_epoch_loss / max(1, candidate_gen_epoch_steps)
-        candidate_gen_avg_weighted = candidate_gen_epoch_weighted / max(1, candidate_gen_epoch_steps)
-        print(
-            "[CAND-GEN-CONS] candidate={}, raw={:.6f}, weighted={:.6f}, skipped_reason={}".format(
-                candidate_gen_epoch_count,
-                candidate_gen_avg_loss,
-                candidate_gen_avg_weighted,
-                candidate_gen_skip_reason,
+            print(
+                "[TDUS] base_score_mean={:.4f}, final_score_mean={:.4f}, gen_rel_weight={:.4f}".format(
+                    tdus_info.get("base_score_mean", 0.0),
+                    tdus_info.get("final_score_mean", 0.0),
+                    tdus_info.get("gen_rel_weight", 0.0),
+                )
             )
-        )
-
+            print(
+                "[GEN-GATE] core_pool_global={}, core_low_agree_global={}, core_low_prob_cons_global={}, core_low_quality_global={}, downgraded_global={}".format(
+                    tdus_info.get("core_before_gen_gate", 0),
+                    tdus_info.get("core_low_agree", 0),
+                    tdus_info.get("core_low_prob_cons", 0),
+                    tdus_info.get("core_low_quality", 0),
+                    tdus_info.get("downgraded_to_candidate", 0),
+                )
+            )
+            print(
+                "[TDUS] core_before_gen_gate={}, core_after_gen_gate={}, downgraded_to_candidate={}".format(
+                    tdus_info.get("core_before_gen_gate", 0),
+                    tdus_info.get("core_after_gen_gate", 0),
+                    tdus_info.get("downgraded_to_candidate", 0),
+                )
+            )
+            print(
+                "[ETDUS] core_global={}, candidate_global={}, unselected={}, pre_core_hist={}, core_hist={}, candidate_hist={}, coverage={}, missing_core_classes={}, missing_candidate_classes={}".format(
+                    tdus_info.get("num_core", tdus_info.get("num_selected", 0)),
+                    tdus_info.get("num_candidate", 0),
+                    tdus_info.get("num_unselected", 0),
+                    tdus_info.get("pre_core_hist", [0 for _ in range(CLASS_NUM)]),
+                    tdus_info.get("core_hist", tdus_info.get("class_hist", [0 for _ in range(CLASS_NUM)])),
+                    tdus_info.get("candidate_hist", [0 for _ in range(CLASS_NUM)]),
+                    tdus_info.get("coverage", 0),
+                    tdus_info.get("missing_core_classes", []),
+                    tdus_info.get("missing_candidate_classes", []),
+                )
+            )
+            if args.align_type == "tg_ccal":
+                print(
+                    "[TG-CCAL] epoch={}, core_global={}, core_batch={}, effective_ratio={:.4f}, valid_classes={}, skipped_classes={}, loss={:.6f}, raw_loss={:.6f}, mean={:.6f}, cov={:.6f}, proto={:.6f}, class_counts_batch={}".format(
+                        epoch,
+                        tgccal_epoch_info.get("core_global", 0),
+                        tgccal_epoch_info.get("core_batch", 0),
+                        tgccal_epoch_info.get("effective_ratio", 0.0),
+                        tgccal_epoch_info["valid_classes"],
+                        tgccal_epoch_info.get("skipped_classes", []),
+                        tgccal_epoch_info.get("weighted_loss", 0.0),
+                        tgccal_epoch_info.get("loss", 0.0),
+                        tgccal_epoch_info["mean"],
+                        tgccal_epoch_info["cov"],
+                        tgccal_epoch_info["proto"],
+                        tgccal_epoch_info["class_counts"],
+                    )
+                )
+                if tgccal_epoch_info.get("skip_reason", ""):
+                    print("[TG-CCAL][SKIP] reason={}".format(tgccal_epoch_info["skip_reason"]))
+            candidate_avg_loss = candidate_epoch_loss / max(1, candidate_epoch_steps)
+            print(
+                "[CAND-KL] candidate_global={}, candidate_used={}, candidate_batch={}, loss={:.6f}, weight={:.6f}".format(
+                    tdus_info.get("num_candidate", 0),
+                    candidate_epoch_count,
+                    candidate_batch_last,
+                    candidate_avg_loss,
+                    args.candidate_consistency_weight if bool(args.use_candidate_consistency) else 0.0,
+                )
+            )
+            if candidate_skip_epoch:
+                print("[CAND-KL][SKIP] {}".format(candidate_skip_reason))
+            tgt_ce_avg_raw = tgt_ce_epoch_raw / max(1, tgt_ce_epoch_steps)
+            tgt_ce_avg_weighted = tgt_ce_epoch_weighted / max(1, tgt_ce_epoch_steps)
+            print(
+                "[TGT-CE] core={}, raw={:.6f}, weighted={:.6f}".format(
+                    tgt_ce_epoch_count,
+                    tgt_ce_avg_raw,
+                    tgt_ce_avg_weighted,
+                )
+            )
+            candidate_gen_avg_loss = candidate_gen_epoch_loss / max(1, candidate_gen_epoch_steps)
+            candidate_gen_avg_weighted = candidate_gen_epoch_weighted / max(1, candidate_gen_epoch_steps)
+            print(
+                "[CAND-GEN-CONS] candidate={}, raw={:.6f}, weighted={:.6f}, skipped_reason={}".format(
+                    candidate_gen_epoch_count,
+                    candidate_gen_avg_loss,
+                    candidate_gen_avg_weighted,
+                    candidate_gen_skip_reason,
+                )
+            )
+    
         cls_losses.append(cls_loss.item())
 
         lmmd_losses.append(lmmd_loss.item())
