@@ -2,7 +2,7 @@ nDataSet = 3
 
 BATCH_SIZE = 32
 epochs = 100
-lr = 0.01
+lr = 0.001
 CLASS_NUM = 7
 nBand = 102
 HalfWidth =  3   #4  5
