@@ -48,9 +48,11 @@ group_model.add_argument('--lambda_NCE', type=float, default=1.0, help='weight f
 group_model.add_argument('--GIN_ch', type=int, default=24, help='channel of GIN')
 group_model.add_argument('--n_bands', type=int, default=198)
 group_model.add_argument('--use_tdus', action='store_true', default=False, help='enable TDUS pseudo-label training')
-group_model.add_argument('--align_type', type=str, default='tg_ccal',
+group_model.add_argument('--align_type', type=str, default='none',
                          choices=['none', 'global_cal', 'tg_ccal'],
                          help='alignment loss type')
+group_model.add_argument('--lambda_con_s', type=float, default=1.0)
+group_model.add_argument('--lambda_con_t', type=float, default=1.0)
 group_model.add_argument('--tgccal_weight', type=float, default=0.01, help='TG-CCAL loss weight')
 group_model.add_argument('--tgccal_min_samples', type=int, default=2,
                          help='minimum samples per class for TG-CCAL')
@@ -74,6 +76,8 @@ group_model.add_argument('--candidate_entropy_start', type=float, default=0.50)
 group_model.add_argument('--candidate_entropy_end', type=float, default=0.80)
 group_model.add_argument('--use_gen_reliability', type=int, default=1)
 group_model.add_argument('--gen_rel_weight', type=float, default=0.30)
+group_model.add_argument('--gen_rel_mode', type=str, default='gate_only',
+                         choices=['fusion', 'gate_only', 'penalty'])
 group_model.add_argument('--gen_rel_rec_weight', type=float, default=1.0)
 group_model.add_argument('--gen_rel_sam_weight', type=float, default=1.0)
 group_model.add_argument('--gen_rel_w_agree', type=float, default=0.35)
@@ -83,6 +87,7 @@ group_model.add_argument('--gen_rel_w_quality', type=float, default=0.15)
 group_model.add_argument('--gen_min_agreement', type=float, default=0.67)
 group_model.add_argument('--gen_min_prob_consistency', type=float, default=0.50)
 group_model.add_argument('--gen_min_quality', type=float, default=0.30)
+group_model.add_argument('--gen_gate_strict', type=int, default=0)
 group_model.add_argument('--use_candidate_gen_consistency', type=int, default=1)
 group_model.add_argument('--candidate_gen_cons_type', type=str, default='prob',
                          choices=['prob', 'feature', 'both'])
@@ -286,6 +291,8 @@ for iDataSet in range(nDataSet):
                 generator_model=G_net,
                 use_gen_reliability=bool(args.use_gen_reliability),
                 gen_rel_weight=args.gen_rel_weight,
+                gen_rel_mode=args.gen_rel_mode,
+                gen_gate_strict=bool(args.gen_gate_strict),
                 gen_rel_rec_weight=args.gen_rel_rec_weight,
                 gen_rel_sam_weight=args.gen_rel_sam_weight,
                 gen_rel_w_agree=args.gen_rel_w_agree,
@@ -624,7 +631,9 @@ for iDataSet in range(nDataSet):
             loss_min = loss_aug1 + loss_aug2 + loss_aug3 + source_loss_kl + 0.5 * target_loss_kl
             # print("loss_min", loss_min)
 
-            loss = cls_loss + 0.01 * lambd * lmmd_loss + contrastive_loss_s + contrastive_loss_t + domain_similar_loss + loss_correlation_alignment_loss + loss_min
+            weighted_con_s = args.lambda_con_s * contrastive_loss_s
+            weighted_con_t = args.lambda_con_t * contrastive_loss_t
+            loss = cls_loss + 0.01 * lambd * lmmd_loss + weighted_con_s + weighted_con_t + domain_similar_loss + loss_correlation_alignment_loss + loss_min
             # print(loss)
 
             # Update parameters
@@ -759,6 +768,16 @@ for iDataSet in range(nDataSet):
                         contrastive_loss_t.item(),
                         total_hit / size, loss_min.item(), loss_correlation_alignment_loss.item(), loss.item()))
         print(
+            "[CON] raw_s={:.6f}, raw_t={:.6f}, lambda_s={:.4f}, lambda_t={:.4f}, weighted_s={:.6f}, weighted_t={:.6f}".format(
+                contrastive_loss_s.item(),
+                contrastive_loss_t.item(),
+                args.lambda_con_s,
+                args.lambda_con_t,
+                weighted_con_s.item(),
+                weighted_con_t.item(),
+            )
+        )
+        print(
             "[GEN-REL] mean={:.4f}, min={:.4f}, max={:.4f}, agree_mean={:.4f}, prob_cons_mean={:.4f}, feat_cons_mean={:.4f}, gen_quality_mean={:.4f}".format(
                 tdus_info.get("gen_rel_mean", 0.0),
                 tdus_info.get("gen_rel_min", 0.0),
@@ -781,6 +800,15 @@ for iDataSet in range(nDataSet):
                 tdus_info.get("base_score_mean", 0.0),
                 tdus_info.get("final_score_mean", 0.0),
                 tdus_info.get("gen_rel_weight", 0.0),
+            )
+        )
+        print(
+            "[GEN-GATE] core_pool_global={}, core_low_agree_global={}, core_low_prob_cons_global={}, core_low_quality_global={}, downgraded_global={}".format(
+                tdus_info.get("core_before_gen_gate", 0),
+                tdus_info.get("core_low_agree", 0),
+                tdus_info.get("core_low_prob_cons", 0),
+                tdus_info.get("core_low_quality", 0),
+                tdus_info.get("downgraded_to_candidate", 0),
             )
         )
         print(

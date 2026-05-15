@@ -143,14 +143,22 @@ def compute_generation_reliability(
 def fuse_tdus_score_with_generation(
     base_tdus_score,
     gen_reliability,
+    gen_agreement=None,
     gen_rel_weight=0.30,
     use_gen_reliability=True,
+    gen_rel_mode="gate_only",
 ):
     if not use_gen_reliability:
-        return base_tdus_score.clamp(0.0, 1.0)
+        return base_tdus_score
     gen_rel_weight = float(max(0.0, min(1.0, gen_rel_weight)))
-    final_score = (1.0 - gen_rel_weight) * base_tdus_score + gen_rel_weight * gen_reliability
-    return final_score.clamp(0.0, 1.0)
+    if gen_rel_mode == "fusion":
+        final_score = (1.0 - gen_rel_weight) * base_tdus_score + gen_rel_weight * gen_reliability
+        return final_score.clamp(0.0, 1.0)
+    if gen_rel_mode == "penalty":
+        if gen_agreement is None:
+            gen_agreement = gen_reliability
+        return base_tdus_score - gen_rel_weight * (1.0 - gen_agreement)
+    return base_tdus_score
 
 
 def apply_generation_reliability_gate(

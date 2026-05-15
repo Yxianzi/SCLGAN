@@ -270,12 +270,17 @@ def _attach_generation_info(
         base_score_all=None,
         final_score_all=None,
         gen_rel_weight=0.0,
+        gen_rel_mode="gate_only",
+        gen_gate_strict=False,
         gen_min_agreement=0.67,
         gen_min_prob_consistency=0.50,
         gen_min_quality=0.30,
         core_before_gen_gate=0,
         core_after_gen_gate=0,
-        downgraded_to_candidate=0):
+        downgraded_to_candidate=0,
+        core_low_agree=0,
+        core_low_prob_cons=0,
+        core_low_quality=0):
     def _mean_or_zero(x):
         return float(x.mean().item()) if x is not None and x.numel() > 0 else 0.0
 
@@ -291,6 +296,8 @@ def _attach_generation_info(
     info.update({
         "use_gen_reliability": bool(active_gen_reliability),
         "gen_rel_weight": float(gen_rel_weight) if active_gen_reliability else 0.0,
+        "gen_rel_mode": gen_rel_mode if active_gen_reliability else "disabled",
+        "gen_gate_strict": bool(gen_gate_strict),
         "gen_rel_mean": _mean_or_zero(gen_rel_all),
         "gen_rel_min": _min_or_zero(gen_rel_all),
         "gen_rel_max": _max_or_zero(gen_rel_all),
@@ -306,6 +313,9 @@ def _attach_generation_info(
         "core_before_gen_gate": int(core_before_gen_gate),
         "core_after_gen_gate": int(core_after_gen_gate),
         "downgraded_to_candidate": int(downgraded_to_candidate),
+        "core_low_agree": int(core_low_agree),
+        "core_low_prob_cons": int(core_low_prob_cons),
+        "core_low_quality": int(core_low_quality),
     })
     return info
 
@@ -350,6 +360,8 @@ def build_cbp_tdus_dataset(
     gen_rel_w_prob=0.30,
     gen_rel_w_feat=0.20,
     gen_rel_w_quality=0.15,
+    gen_rel_mode="gate_only",
+    gen_gate_strict=False,
     gen_min_agreement=0.67,
     gen_min_prob_consistency=0.50,
     gen_min_quality=0.30,
@@ -618,7 +630,12 @@ def build_cbp_tdus_dataset(
     base_tdus_score_all = base_score_all + spatial_weight * spatial_agree_all
     active_gen_reliability = bool(use_gen_reliability) and generator_model is not None
     gen_rel_weight = float(max(0.0, min(1.0, gen_rel_weight)))
-    if active_gen_reliability:
+    gen_rel_mode = str(gen_rel_mode).lower()
+    if gen_rel_mode not in ("fusion", "gate_only", "penalty"):
+        gen_rel_mode = "gate_only"
+    if bool(gen_gate_strict):
+        gen_min_agreement = 1.0
+    if active_gen_reliability and gen_rel_mode == "fusion":
         base_min = base_tdus_score_all.min()
         base_max = base_tdus_score_all.max()
         if (base_max - base_min).abs() < 1e-8:
@@ -628,8 +645,19 @@ def build_cbp_tdus_dataset(
         score_all = fuse_tdus_score_with_generation(
             base_score_for_fusion.clamp(0.0, 1.0),
             gen_rel_all.clamp(0.0, 1.0),
+            gen_agreement=gen_agree_all.clamp(0.0, 1.0),
             gen_rel_weight=gen_rel_weight,
             use_gen_reliability=True,
+            gen_rel_mode=gen_rel_mode,
+        )
+    elif active_gen_reliability and gen_rel_mode == "penalty":
+        score_all = fuse_tdus_score_with_generation(
+            base_tdus_score_all,
+            gen_rel_all,
+            gen_agreement=gen_agree_all,
+            gen_rel_weight=gen_rel_weight,
+            use_gen_reliability=True,
+            gen_rel_mode=gen_rel_mode,
         )
     else:
         score_all = base_tdus_score_all
@@ -695,6 +723,8 @@ def build_cbp_tdus_dataset(
             base_tdus_score_all,
             score_all,
             gen_rel_weight,
+            gen_rel_mode,
+            bool(gen_gate_strict),
             gen_min_agreement,
             gen_min_prob_consistency,
             gen_min_quality,
@@ -760,6 +790,8 @@ def build_cbp_tdus_dataset(
             base_tdus_score_all,
             score_all,
             gen_rel_weight,
+            gen_rel_mode,
+            bool(gen_gate_strict),
             gen_min_agreement,
             gen_min_prob_consistency,
             gen_min_quality,
@@ -778,6 +810,16 @@ def build_cbp_tdus_dataset(
     score_threshold = float(torch.quantile(valid_scores, quality_quantile).item())
 
     core_pool_before_gen_gate = base_candidate_mask & (score_all >= score_threshold)
+    effective_gen_min_agreement = 1.0 if bool(gen_gate_strict) else float(gen_min_agreement)
+    core_low_agree = int(
+        (core_pool_before_gen_gate & (gen_agree_all < effective_gen_min_agreement)).sum().item()
+    )
+    core_low_prob_cons = int(
+        (core_pool_before_gen_gate & (gen_prob_cons_all < float(gen_min_prob_consistency))).sum().item()
+    )
+    core_low_quality = int(
+        (core_pool_before_gen_gate & (gen_quality_all < float(gen_min_quality))).sum().item()
+    )
     if active_gen_reliability:
         gate_info = apply_generation_reliability_gate(
             core_mask=core_pool_before_gen_gate,
@@ -785,7 +827,7 @@ def build_cbp_tdus_dataset(
             agreement=gen_agree_all,
             prob_consistency=gen_prob_cons_all,
             gen_quality=gen_quality_all,
-            gen_min_agreement=gen_min_agreement,
+            gen_min_agreement=effective_gen_min_agreement,
             gen_min_prob_consistency=gen_min_prob_consistency,
             gen_min_quality=gen_min_quality,
         )
@@ -864,12 +906,17 @@ def build_cbp_tdus_dataset(
             base_tdus_score_all,
             score_all,
             gen_rel_weight,
+            gen_rel_mode,
+            bool(gen_gate_strict),
             gen_min_agreement,
             gen_min_prob_consistency,
             gen_min_quality,
             core_before_gen_gate=int(core_pool_before_gen_gate.sum().item()),
             core_after_gen_gate=int(core_pool_mask.sum().item()),
             downgraded_to_candidate=int(downgraded_to_candidate_mask.sum().item()),
+            core_low_agree=core_low_agree,
+            core_low_prob_cons=core_low_prob_cons,
+            core_low_quality=core_low_quality,
         )
         info = _attach_candidate_info(
             info,
@@ -950,12 +997,17 @@ def build_cbp_tdus_dataset(
             base_tdus_score_all,
             score_all,
             gen_rel_weight,
+            gen_rel_mode,
+            bool(gen_gate_strict),
             gen_min_agreement,
             gen_min_prob_consistency,
             gen_min_quality,
             core_before_gen_gate=int(core_pool_before_gen_gate.sum().item()),
             core_after_gen_gate=int(core_pool_mask.sum().item()),
             downgraded_to_candidate=int(downgraded_to_candidate_mask.sum().item()),
+            core_low_agree=core_low_agree,
+            core_low_prob_cons=core_low_prob_cons,
+            core_low_quality=core_low_quality,
         )
         info = _attach_candidate_info(
             info,
@@ -1032,12 +1084,17 @@ def build_cbp_tdus_dataset(
         base_tdus_score_all,
         score_all,
         gen_rel_weight,
+        gen_rel_mode,
+        bool(gen_gate_strict),
         gen_min_agreement,
         gen_min_prob_consistency,
         gen_min_quality,
         core_before_gen_gate=int(core_pool_before_gen_gate.sum().item()),
         core_after_gen_gate=int(core_pool_mask.sum().item()),
         downgraded_to_candidate=int(downgraded_to_candidate_mask.sum().item()),
+        core_low_agree=core_low_agree,
+        core_low_prob_cons=core_low_prob_cons,
+        core_low_quality=core_low_quality,
     )
     info = _attach_candidate_info(
         info,
