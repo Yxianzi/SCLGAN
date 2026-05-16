@@ -50,10 +50,6 @@ group_model.add_argument('--gen_gamma', type=float, default=0.05)
 group_model.add_argument('--gen_preserve_weight', type=float, default=0.01)
 group_model.add_argument('--gen_sam_weight', type=float, default=0.1)
 group_model.add_argument('--use_tdus', action='store_true', default=False, help='enable TDUS pseudo-label training')
-group_model.add_argument('--disable_target_contrast', action='store_true', default=False,
-                         help='disable target contrastive loss')
-group_model.add_argument('--delay_target_contrast', action='store_true', default=False,
-                         help='delay target contrastive loss until train_num')
 group_model.add_argument('--align_type', type=str, default='none',
                          choices=['none', 'global_cal', 'tg_ccal'],
                          help='alignment loss type')
@@ -101,6 +97,7 @@ group_model.add_argument('--lambda_candidate_gen_cons', type=float, default=0.00
 group_model.add_argument('--candidate_gen_cons_max_loss', type=float, default=2.0)
 group_model.add_argument('--use_reliability_tce', type=int, default=1)
 group_model.add_argument('--lambda_tgt_ce', type=float, default=0.05)
+group_model.add_argument('--verbose_tdus_log', type=int, default=1)
 
 args = parser.parse_args()
 print(args)
@@ -131,6 +128,8 @@ lambda_ent = 0.0
 lambda_bal = 0.0
 lambda_cpc = 0.0
 lambda_cpc_cov = 0.0
+cpc_warmup_epoch = 30
+cpc_ramp_epoch = 20
 
 
 def candidate_thresholds_for_epoch(epoch):
@@ -160,12 +159,64 @@ def correlation_alignment_loss(source_features, target_features):
     return loss
 
 
+def distribution_balance_regularization(target_outputs, num_classes, lambda_ent=0.0, lambda_bal=0.0):
+    target_prob = torch.softmax(target_outputs, dim=1)
+    entropy_loss = -torch.mean(torch.sum(target_prob * torch.log(target_prob + 1e-8), dim=1))
+    p_mean = target_prob.mean(dim=0)
+    uniform = torch.ones_like(p_mean) / num_classes
+    balance_loss = torch.sum(p_mean * torch.log((p_mean + 1e-8) / (uniform + 1e-8)))
+    loss_dbr = lambda_ent * entropy_loss + lambda_bal * balance_loss
+    return loss_dbr, entropy_loss, balance_loss, target_prob
+
+
 def sam_loss(x, y, eps=1e-6):
     x_flat = x.reshape(x.size(0), -1)
     y_flat = y.reshape(y.size(0), -1)
     cos = F.cosine_similarity(x_flat, y_flat, dim=1, eps=eps)
     cos = cos.clamp(-1.0 + eps, 1.0 - eps)
     return torch.acos(cos).mean()
+
+
+def class_prototype_covariance_alignment(
+        source_features,
+        source_labels,
+        target_features,
+        target_prob,
+        num_classes,
+        lambda_cov=0.0):
+    loss_proto = source_features.new_tensor(0.0)
+    loss_cov = source_features.new_tensor(0.0)
+    valid_classes = 0
+    source_labels = source_labels.view(-1).long()
+    target_prob = target_prob.detach()
+
+    for class_id in range(num_classes):
+        source_mask = source_labels == class_id
+        source_count = source_mask.sum()
+        if source_count.item() < 2:
+            continue
+
+        target_weight = target_prob[:, class_id]
+        target_weight_sum = target_weight.sum()
+        if target_weight_sum.detach().item() < 1e-3:
+            continue
+
+        class_source_features = source_features[source_mask]
+        source_proto = class_source_features.mean(dim=0)
+        target_proto = (target_features * target_weight.unsqueeze(1)).sum(dim=0) / target_weight_sum.clamp_min(1e-8)
+
+        source_centered = class_source_features - source_proto
+        target_centered = target_features - target_proto
+        source_cov = source_centered.t().mm(source_centered) / (source_count.float() - 1.0)
+        target_cov = (target_centered * target_weight.unsqueeze(1)).t().mm(target_centered) / target_weight_sum.clamp_min(1e-8)
+
+        loss_proto = loss_proto + torch.sum((source_proto - target_proto) ** 2)
+        loss_cov = loss_cov + torch.sum((source_cov - target_cov) ** 2)
+        valid_classes += 1
+
+    if valid_classes == 0:
+        return source_features.new_tensor(0.0)
+    return loss_proto + lambda_cov * loss_cov
 
 
 for iDataSet in range(nDataSet):
@@ -242,6 +293,7 @@ for iDataSet in range(nDataSet):
     for epoch in range(1, epochs + 1):
         LEARNING_RATE = lr / math.pow((1 + 10 * (epoch - 1) / epochs), 0.75)
         print('learning rate{: .4f}'.format(LEARNING_RATE))
+        tdus_refreshed = False
         optimizer = torch.optim.SGD([
             {'params': feature_encoder.mp.parameters(), 'lr': LEARNING_RATE},
             {'params': feature_encoder.Spatial_Weight_1.parameters(), 'lr': LEARNING_RATE},
@@ -295,7 +347,7 @@ for iDataSet in range(nDataSet):
                 use_spatial=True,
                 spatial_window=3,
                 min_spatial_agree=0.50,
-                spatial_weight=0.20,
+                spatial_weight=0.05,
                 target_rows=Row[RandPerm],
                 target_cols=Column[RandPerm],
                 target_height=G.shape[0],
@@ -319,25 +371,27 @@ for iDataSet in range(nDataSet):
                 gen_min_prob_consistency=args.gen_min_prob_consistency,
                 gen_min_quality=args.gen_min_quality,
             )
+            tdus_refreshed = True
 
-            if tdus_info.get("spatial_status", "") in ("disabled_missing_coordinates", "disabled_invalid_coordinates"):
+            if bool(args.verbose_tdus_log) and tdus_info.get("spatial_status", "") in ("disabled_missing_coordinates", "disabled_invalid_coordinates"):
                 print("[SC-DAPT-TDUS] spatial disabled due to missing coordinates:", tdus_info["spatial_status"])
 
             if tdus_info["num_selected"] == 0:
                 labeled_loader = None
-                print(
-                    "[SC-DAPT-TDUS] Skip pseudo-label fine-tuning: "
-                    f"reason={tdus_info['skip_reason']}, "
-                    f"core_hist={tdus_info['class_hist']}, "
-                    f"pre_core_hist={tdus_info.get('pre_core_hist', [])}, "
-                    f"coverage={tdus_info['coverage']}, "
-                    f"max_prior={tdus_info['max_prior']:.4f}, "
-                    f"mixed_prior={['{:.3f}'.format(x) for x in tdus_info['mixed_prior']]}, "
-                    f"quota={tdus_info['quota_per_class']}, "
-                    f"score_threshold={tdus_info['score_threshold']:.4f}, "
-                    f"min_class_count={tdus_info['min_class_count']}, "
-                    f"spa_agree={tdus_info['mean_spatial_agree']:.4f}"
-                )
+                if bool(args.verbose_tdus_log):
+                    print(
+                        "[SC-DAPT-TDUS] Skip pseudo-label fine-tuning: "
+                        f"reason={tdus_info['skip_reason']}, "
+                        f"core_hist={tdus_info['class_hist']}, "
+                        f"pre_core_hist={tdus_info.get('pre_core_hist', [])}, "
+                        f"coverage={tdus_info['coverage']}, "
+                        f"max_prior={tdus_info['max_prior']:.4f}, "
+                        f"mixed_prior={['{:.3f}'.format(x) for x in tdus_info['mixed_prior']]}, "
+                        f"quota={tdus_info['quota_per_class']}, "
+                        f"score_threshold={tdus_info['score_threshold']:.4f}, "
+                        f"min_class_count={tdus_info['min_class_count']}, "
+                        f"spa_agree={tdus_info['mean_spatial_agree']:.4f}"
+                    )
             else:
                 labeled_loader = DataLoader(
                     labeled_dataset,
@@ -360,29 +414,30 @@ for iDataSet in range(nDataSet):
             else:
                 candidate_loader = None
 
-            print(
-                "[SC-DAPT-TDUS][{}] epoch={}, selected={}, core_hist={}, pre_core_hist={}, coverage={}, pred_prior={}, mixed_prior={}, quota_per_class={}, max_prior={:.4f}, score_threshold={:.4f}, min_class_count={}, spa_agree={:.4f}, skip_reason={}, conf={:.4f}, ent={:.4f}, proto_dist={:.4f}, agree={:.4f}, score={:.4f}".format(
-                    dataset_name,
-                    epoch,
-                    tdus_info["num_selected"],
-                    tdus_info["class_hist"],
-                    tdus_info.get("pre_core_hist", []),
-                    tdus_info["coverage"],
-                    ["{:.3f}".format(x) for x in tdus_info["pred_prior"]],
-                    ["{:.3f}".format(x) for x in tdus_info["mixed_prior"]],
-                    tdus_info["quota_per_class"],
-                    tdus_info["max_prior"],
-                    tdus_info["score_threshold"],
-                    tdus_info["min_class_count"],
-                    tdus_info["mean_spatial_agree"],
-                    tdus_info["skip_reason"],
-                    tdus_info["mean_conf"],
-                    tdus_info["mean_entropy"],
-                    tdus_info["mean_proto_dist"],
-                    tdus_info["mean_agree"],
-                    tdus_info["mean_score"],
+            if bool(args.verbose_tdus_log):
+                print(
+                    "[SC-DAPT-TDUS][{}] epoch={}, selected={}, core_hist={}, pre_core_hist={}, coverage={}, pred_prior={}, mixed_prior={}, quota_per_class={}, max_prior={:.4f}, score_threshold={:.4f}, min_class_count={}, spa_agree={:.4f}, skip_reason={}, conf={:.4f}, ent={:.4f}, proto_dist={:.4f}, agree={:.4f}, score={:.4f}".format(
+                        dataset_name,
+                        epoch,
+                        tdus_info["num_selected"],
+                        tdus_info["class_hist"],
+                        tdus_info.get("pre_core_hist", []),
+                        tdus_info["coverage"],
+                        ["{:.3f}".format(x) for x in tdus_info["pred_prior"]],
+                        ["{:.3f}".format(x) for x in tdus_info["mixed_prior"]],
+                        tdus_info["quota_per_class"],
+                        tdus_info["max_prior"],
+                        tdus_info["score_threshold"],
+                        tdus_info["min_class_count"],
+                        tdus_info["mean_spatial_agree"],
+                        tdus_info["skip_reason"],
+                        tdus_info["mean_conf"],
+                        tdus_info["mean_entropy"],
+                        tdus_info["mean_proto_dist"],
+                        tdus_info["mean_agree"],
+                        tdus_info["mean_score"],
+                    )
                 )
-            )
             # print("开始主动学习")
             # 评估未标注数据的预测概率
 
@@ -414,6 +469,11 @@ for iDataSet in range(nDataSet):
             len_candidate_loader = len(candidate_loader)
 
         num_iter = len_source_loader
+        epoch_dbr_ent = 0.0
+        epoch_dbr_bal = 0.0
+        epoch_cpc_cal_loss = 0.0
+        epoch_cpc_weight = 0.0
+        epoch_loss_steps = 0
         tgccal_epoch_info = {
             "valid_classes": 0,
             "selected": 0,
@@ -516,7 +576,19 @@ for iDataSet in range(nDataSet):
             _, _, target2, t1, _ = feature_encoder(target_aug_img1.cuda())
             _, _, target3, t2, _ = feature_encoder(target_aug_img2.cuda())
 
-            softmax_output_t = nn.Softmax(dim=1)(target_outputs).detach()
+            if USE_DBR:
+                loss_dbr, dbr_ent, dbr_bal, target_prob = distribution_balance_regularization(
+                    target_outputs,
+                    CLASS_NUM,
+                    lambda_ent=lambda_ent,
+                    lambda_bal=lambda_bal
+                )
+            else:
+                target_prob = torch.softmax(target_outputs, dim=1)
+                loss_dbr = target_outputs.new_tensor(0.0)
+                dbr_ent = target_outputs.new_tensor(0.0)
+                dbr_bal = target_outputs.new_tensor(0.0)
+            softmax_output_t = target_prob.detach()
             _, pseudo_label_t = torch.max(softmax_output_t, 1)
             tdus_clean_batch = None
             clean_tgccal_feat = None
@@ -540,7 +612,7 @@ for iDataSet in range(nDataSet):
             all_target_con_features = torch.cat([target2.unsqueeze(1), target3.unsqueeze(1)], dim=1)  # 32 2 128
             # print("all_target_con_features",all_target_con_features.shape)
             lmmd_loss = mmd.lmmd(source_features, target_features, source_label,
-                                 torch.nn.functional.softmax(target_outputs, dim=1), BATCH_SIZE=BATCH_SIZE,
+                                 target_prob, BATCH_SIZE=BATCH_SIZE,
                                  CLASS_NUM=CLASS_NUM)
             lambd = 2 / (1 + math.exp(-10 * (epoch) / epochs)) - 1
             # 计算源域和目标域之间的距离
@@ -557,12 +629,7 @@ for iDataSet in range(nDataSet):
             contrastive_loss_s = ContrastiveLoss_s(all_source_con_features, source_label)  #
 
             # Loss Con_t
-            if args.disable_target_contrast:
-                contrastive_loss_t = torch.zeros((), device=target_outputs.device)
-            elif args.delay_target_contrast and epoch < train_num:
-                contrastive_loss_t = torch.zeros((), device=target_outputs.device)
-            else:
-                contrastive_loss_t = ContrastiveLoss_t(all_target_con_features, pseudo_label_t)  #
+            contrastive_loss_t = ContrastiveLoss_t(all_target_con_features, pseudo_label_t)  #
             # print(contrastive_loss_t)
             tgccal_info = {
                 "valid_classes": 0,
@@ -631,6 +698,17 @@ for iDataSet in range(nDataSet):
                     tgccal_info["core_global"] = int(tdus_info.get("num_core", tdus_info.get("num_selected", 0)))
                     tgccal_info["skip_reason"] = "insufficient_core_or_coverage"
             tgccal_epoch_info = tgccal_info
+            if USE_CPC or USE_PPA:
+                cpc_cal_loss = class_prototype_covariance_alignment(
+                    source_features,
+                    source_label,
+                    target_features,
+                    target_prob.detach(),
+                    CLASS_NUM,
+                    lambda_cov=lambda_cpc_cov
+                )
+            else:
+                cpc_cal_loss = target_outputs.new_tensor(0.0)
 
             # loss_center_alignment_loss = center_alignment_loss(source1, target1)
 
@@ -661,11 +739,27 @@ for iDataSet in range(nDataSet):
             loss_min = loss_aug1 + loss_aug2 + loss_aug3 + source_loss_kl + 0.5 * target_loss_kl
             # print("loss_min", loss_min)
 
+            cpc_progress = min(max((epoch - cpc_warmup_epoch) / float(cpc_ramp_epoch), 0.0), 1.0)
+            cpc_weight = lambda_cpc * cpc_progress if (USE_CPC or USE_PPA) else 0.0
             weighted_con_s = args.lambda_con_s * contrastive_loss_s
             weighted_con_t = args.lambda_con_t * contrastive_loss_t
             weighted_gen_preserve = args.gen_preserve_weight * loss_gen_preserve
-            loss = cls_loss + 0.01 * lambd * lmmd_loss + weighted_con_s + weighted_con_t + domain_similar_loss + loss_correlation_alignment_loss + loss_min + weighted_gen_preserve
+            loss = (
+                cls_loss
+                + 0.01 * lambd * lmmd_loss
+                + weighted_con_s
+                + weighted_con_t
+                + domain_similar_loss
+                + loss_correlation_alignment_loss
+                + loss_min
+                + weighted_gen_preserve
+            )
             # print(loss)
+            epoch_dbr_ent += dbr_ent.item()
+            epoch_dbr_bal += dbr_bal.item()
+            epoch_cpc_cal_loss += cpc_cal_loss.item()
+            epoch_cpc_weight += cpc_weight
+            epoch_loss_steps += 1
 
             # Update parameters
             optimizer.zero_grad()
@@ -812,7 +906,8 @@ for iDataSet in range(nDataSet):
             delta_spe = torch.mean(torch.abs(source_aug_img1 - source_data00)).item()
             delta_spa = torch.mean(torch.abs(source_aug_img2 - source_data00)).item()
         print("[GEN-DELTA] spe={:.6f}, spa={:.6f}".format(delta_spe, delta_spa))
-        print(
+        tdus_detail_print = print if (tdus_refreshed and bool(args.verbose_tdus_log)) else (lambda *args, **kwargs: None)
+        tdus_detail_print(
             "[CON] raw_s={:.6f}, raw_t={:.6f}, lambda_s={:.4f}, lambda_t={:.4f}, weighted_s={:.6f}, weighted_t={:.6f}".format(
                 contrastive_loss_s.item(),
                 contrastive_loss_t.item(),
@@ -822,7 +917,7 @@ for iDataSet in range(nDataSet):
                 weighted_con_t.item(),
             )
         )
-        print(
+        tdus_detail_print(
             "[GEN-REL] mean={:.4f}, min={:.4f}, max={:.4f}, agree_mean={:.4f}, prob_cons_mean={:.4f}, feat_cons_mean={:.4f}, gen_quality_mean={:.4f}".format(
                 tdus_info.get("gen_rel_mean", 0.0),
                 tdus_info.get("gen_rel_min", 0.0),
@@ -833,21 +928,21 @@ for iDataSet in range(nDataSet):
                 tdus_info.get("gen_quality_mean", 0.0),
             )
         )
-        print(
+        tdus_detail_print(
             "[GEN-REL] low_agree={}, low_prob_cons={}, low_quality={}".format(
                 tdus_info.get("low_agree", 0),
                 tdus_info.get("low_prob_cons", 0),
                 tdus_info.get("low_quality", 0),
             )
         )
-        print(
+        tdus_detail_print(
             "[TDUS] base_score_mean={:.4f}, final_score_mean={:.4f}, gen_rel_weight={:.4f}".format(
                 tdus_info.get("base_score_mean", 0.0),
                 tdus_info.get("final_score_mean", 0.0),
                 tdus_info.get("gen_rel_weight", 0.0),
             )
         )
-        print(
+        tdus_detail_print(
             "[GEN-GATE] core_pool_global={}, core_low_agree_global={}, core_low_prob_cons_global={}, core_low_quality_global={}, downgraded_global={}".format(
                 tdus_info.get("core_before_gen_gate", 0),
                 tdus_info.get("core_low_agree", 0),
@@ -856,14 +951,14 @@ for iDataSet in range(nDataSet):
                 tdus_info.get("downgraded_to_candidate", 0),
             )
         )
-        print(
+        tdus_detail_print(
             "[TDUS] core_before_gen_gate={}, core_after_gen_gate={}, downgraded_to_candidate={}".format(
                 tdus_info.get("core_before_gen_gate", 0),
                 tdus_info.get("core_after_gen_gate", 0),
                 tdus_info.get("downgraded_to_candidate", 0),
             )
         )
-        print(
+        tdus_detail_print(
             "[ETDUS] core_global={}, candidate_global={}, unselected={}, pre_core_hist={}, core_hist={}, candidate_hist={}, coverage={}, missing_core_classes={}, missing_candidate_classes={}".format(
                 tdus_info.get("num_core", tdus_info.get("num_selected", 0)),
                 tdus_info.get("num_candidate", 0),
@@ -877,7 +972,7 @@ for iDataSet in range(nDataSet):
             )
         )
         if args.align_type == "tg_ccal":
-            print(
+            tdus_detail_print(
                 "[TG-CCAL] epoch={}, core_global={}, core_batch={}, effective_ratio={:.4f}, valid_classes={}, skipped_classes={}, loss={:.6f}, raw_loss={:.6f}, mean={:.6f}, cov={:.6f}, proto={:.6f}, class_counts_batch={}".format(
                     epoch,
                     tgccal_epoch_info.get("core_global", 0),
@@ -894,9 +989,9 @@ for iDataSet in range(nDataSet):
                 )
             )
             if tgccal_epoch_info.get("skip_reason", ""):
-                print("[TG-CCAL][SKIP] reason={}".format(tgccal_epoch_info["skip_reason"]))
+                tdus_detail_print("[TG-CCAL][SKIP] reason={}".format(tgccal_epoch_info["skip_reason"]))
         candidate_avg_loss = candidate_epoch_loss / max(1, candidate_epoch_steps)
-        print(
+        tdus_detail_print(
             "[CAND-KL] candidate_global={}, candidate_used={}, candidate_batch={}, loss={:.6f}, weight={:.6f}".format(
                 tdus_info.get("num_candidate", 0),
                 candidate_epoch_count,
@@ -906,10 +1001,10 @@ for iDataSet in range(nDataSet):
             )
         )
         if candidate_skip_epoch:
-            print("[CAND-KL][SKIP] {}".format(candidate_skip_reason))
+            tdus_detail_print("[CAND-KL][SKIP] {}".format(candidate_skip_reason))
         tgt_ce_avg_raw = tgt_ce_epoch_raw / max(1, tgt_ce_epoch_steps)
         tgt_ce_avg_weighted = tgt_ce_epoch_weighted / max(1, tgt_ce_epoch_steps)
-        print(
+        tdus_detail_print(
             "[TGT-CE] core={}, raw={:.6f}, weighted={:.6f}".format(
                 tgt_ce_epoch_count,
                 tgt_ce_avg_raw,
@@ -918,7 +1013,7 @@ for iDataSet in range(nDataSet):
         )
         candidate_gen_avg_loss = candidate_gen_epoch_loss / max(1, candidate_gen_epoch_steps)
         candidate_gen_avg_weighted = candidate_gen_epoch_weighted / max(1, candidate_gen_epoch_steps)
-        print(
+        tdus_detail_print(
             "[CAND-GEN-CONS] candidate={}, raw={:.6f}, weighted={:.6f}, skipped_reason={}".format(
                 candidate_gen_epoch_count,
                 candidate_gen_avg_loss,
