@@ -933,21 +933,11 @@ def build_cbp_tdus_dataset(
     coverage = sum([1 for x in class_hist if x > 0])
     nonzero_counts = [int(x) for x in class_hist if int(x) > 0]
 
-    if (
-        coverage < min_coverage
-        or selected_indices.numel() < min_selected
-        or len(nonzero_counts) < min_coverage
-        or min(nonzero_counts) < min_class_count
-    ):
+    if selected_indices.numel() < min_selected:
         empty_data = data_all[:0].float()
         empty_label = pseudo_all[:0].long()
         empty_weight = score_all[:0].float()
-        if selected_indices.numel() < min_selected:
-            skip_reason = "too_few_selected"
-        elif coverage < min_coverage:
-            skip_reason = "low_selected_coverage"
-        else:
-            skip_reason = "imbalanced_selected_classes"
+        skip_reason = "too_few_selected"
         candidate_dataset, candidate_info = _build_candidate_dataset_and_info(
             data_all=data_all,
             pseudo_all=pseudo_all,
@@ -1019,6 +1009,18 @@ def build_cbp_tdus_dataset(
         )
         return TensorDataset(empty_data, empty_label, empty_weight), info
 
+    coverage_factor = 1.0
+    class_balance_factor = 1.0
+    soft_accept_reason = ""
+    if coverage < min_coverage or len(nonzero_counts) < min_coverage:
+        coverage_factor = max(0.3, coverage / float(max(1, min_coverage)))
+        soft_accept_reason = "low_coverage_soft_accept"
+    if len(nonzero_counts) > 0 and min(nonzero_counts) < min_class_count:
+        class_balance_factor = 0.5
+        if not soft_accept_reason:
+            soft_accept_reason = "imbalanced_selected_classes_soft_accept"
+    soft_accept_weight_factor = coverage_factor * class_balance_factor
+
     selected_scores = score_all[selected_indices]
     score_min = selected_scores.min()
     score_max = selected_scores.max()
@@ -1032,6 +1034,7 @@ def build_cbp_tdus_dataset(
         0.5 * normalized_score.clamp(0.0, 1.0)
         + 0.5 * conf_all[selected_indices].clamp(0.0, 1.0)
     )
+    selected_weight = selected_weight * float(soft_accept_weight_factor)
 
     selected_data = data_all[selected_indices].float()
     candidate_dataset, candidate_info = _build_candidate_dataset_and_info(
@@ -1071,7 +1074,10 @@ def build_cbp_tdus_dataset(
         "min_spatial_agree": min_spatial_agree,
         "spatial_weight": spatial_weight,
         "spatial_status": spatial_status,
-        "skip_reason": "",
+        "coverage_factor": float(coverage_factor),
+        "class_balance_factor": float(class_balance_factor),
+        "soft_accept_weight_factor": float(soft_accept_weight_factor),
+        "skip_reason": soft_accept_reason,
     }
     info = _attach_generation_info(
         info,
