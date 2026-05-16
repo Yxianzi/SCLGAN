@@ -15,7 +15,7 @@ from contrastive_loss import SupConLoss
 from config_Houston import *
 from sklearn import svm
 import matplotlib.pyplot as plt
-from generator import SSDGnet
+from generator import SSDGnet, CSSGnet
 from Discriminator import discriminator
 from cbp_tdus import (
     ModelEMA,
@@ -46,6 +46,10 @@ group_model.add_argument('--num_patches', type=int, default=256, help='number of
 group_model.add_argument('--lambda_NCE', type=float, default=1.0, help='weight for NCE loss: NCE(G(X), X)')
 group_model.add_argument('--GIN_ch', type=int, default=24, help='channel of GIN')
 group_model.add_argument('--n_bands', type=int, default=48)
+group_model.add_argument('--gen_type', type=str, default='cssg', choices=['original', 'cssg'])
+group_model.add_argument('--gen_gamma', type=float, default=0.05)
+group_model.add_argument('--gen_preserve_weight', type=float, default=0.01)
+group_model.add_argument('--gen_sam_weight', type=float, default=0.1)
 group_model.add_argument('--use_tdus', action='store_true', default=False, help='enable TDUS pseudo-label training')
 group_model.add_argument('--align_type', type=str, default='none',
                          choices=['none', 'global_cal', 'tg_ccal'],
@@ -170,6 +174,15 @@ def distribution_balance_regularization(target_outputs, num_classes, lambda_ent=
     loss_dbr = lambda_ent * entropy_loss + lambda_bal * balance_loss
     return loss_dbr, entropy_loss, balance_loss, target_prob
 
+
+def sam_loss(x, y, eps=1e-6):
+    x_flat = x.reshape(x.size(0), -1)
+    y_flat = y.reshape(y.size(0), -1)
+    cos = F.cosine_similarity(x_flat, y_flat, dim=1, eps=eps)
+    cos = cos.clamp(-1.0 + eps, 1.0 - eps)
+    return torch.acos(cos).mean()
+
+
 def class_prototype_covariance_alignment(
         source_features,
         source_labels,
@@ -245,7 +258,10 @@ for iDataSet in range(nDataSet):
     feature_encoder =discriminator(nBand, 128,  CLASS_NUM,patch_size).cuda()
     teacher_encoder = ModelEMA(feature_encoder, decay=0.99)
     D_opt = torch.optim.Adam(feature_encoder.parameters())
-    G_net = SSDGnet(args).cuda()
+    if args.gen_type == 'cssg':
+        G_net = CSSGnet(args).cuda()
+    else:
+        G_net = SSDGnet(args).cuda()
     G_opt = torch.optim.Adam(G_net.parameters())
 
     print("Training...")
@@ -522,10 +538,21 @@ for iDataSet in range(nDataSet):
             source_aug_img1, source_aug_img2 = G_net(source_data00)
             G_opt.zero_grad()
             target_aug_img1, target_aug_img2 = G_net(target_data00)
+            loss_gen_rec = (
+                F.l1_loss(source_aug_img1, source_data00)
+                + F.l1_loss(source_aug_img2, source_data00)
+                + F.l1_loss(target_aug_img1, target_data00)
+                + F.l1_loss(target_aug_img2, target_data00)
+            )
+            loss_gen_sam = (
+                sam_loss(source_aug_img1, source_data00)
+                + sam_loss(source_aug_img2, source_data00)
+                + sam_loss(target_aug_img1, target_data00)
+                + sam_loss(target_aug_img2, target_data00)
+            )
+            loss_gen_preserve = loss_gen_rec + args.gen_sam_weight * loss_gen_sam
 
-            alpha1 = np.random.beta(0.6, 0.6)
-            alpha2 = np.random.beta(0.6, 0.6)
-            alpha3 = 1 - alpha1 - alpha2
+            alpha1, alpha2, alpha3 = np.random.dirichlet([0.6, 0.6, 0.6])
             source_data = alpha1 * source_aug_img1 + alpha2 * source_aug_img2 + alpha3 * source_data00
             target_data = alpha1 * target_aug_img1 + alpha2 * target_aug_img2 + alpha3 * target_data00
 
@@ -731,6 +758,7 @@ for iDataSet in range(nDataSet):
             cpc_weight = lambda_cpc * cpc_progress if (USE_CPC or USE_PPA) else 0.0
             weighted_con_s = args.lambda_con_s * contrastive_loss_s
             weighted_con_t = args.lambda_con_t * contrastive_loss_t
+            weighted_gen_preserve = args.gen_preserve_weight * loss_gen_preserve
             loss = (
                 cls_loss
                 + 0.01 * lambd * lmmd_loss
@@ -739,6 +767,7 @@ for iDataSet in range(nDataSet):
                 + domain_similar_loss
                 + loss_correlation_alignment_loss
                 + loss_min
+                + weighted_gen_preserve
             )
             # print(loss)
             epoch_dbr_ent += dbr_ent.item()
@@ -753,7 +782,7 @@ for iDataSet in range(nDataSet):
             # loss_min.backward()
             # NOTE: The original-like code updates feature_encoder with both D_opt and optimizer.
             # Keep this behavior unchanged for baseline comparability.
-            D_opt.step()
+            # D_opt.step()
             optimizer.step()
             teacher_encoder.update(feature_encoder)
 
@@ -875,6 +904,20 @@ for iDataSet in range(nDataSet):
                 .format(epoch, cls_loss.item(), lmmd_loss.item(), domain_similar_loss.item(), contrastive_loss_s.item(),
                         contrastive_loss_t.item(),
                         total_hit / size,  loss_min.item(),loss_correlation_alignment_loss.item(), loss.item()))
+        print(
+            "[GEN-PRESERVE] type={}, gamma={:.4f}, rec={:.6f}, sam={:.6f}, preserve={:.6f}, weighted={:.6f}".format(
+                args.gen_type,
+                args.gen_gamma,
+                loss_gen_rec.item(),
+                loss_gen_sam.item(),
+                loss_gen_preserve.item(),
+                weighted_gen_preserve.item(),
+            )
+        )
+        with torch.no_grad():
+            delta_spe = torch.mean(torch.abs(source_aug_img1 - source_data00)).item()
+            delta_spa = torch.mean(torch.abs(source_aug_img2 - source_data00)).item()
+        print("[GEN-DELTA] spe={:.6f}, spa={:.6f}".format(delta_spe, delta_spa))
         if tdus_refreshed and bool(args.verbose_tdus_log):
             print(
                 "[CON] raw_s={:.6f}, raw_t={:.6f}, lambda_s={:.4f}, lambda_t={:.4f}, weighted_s={:.6f}, weighted_t={:.6f}".format(

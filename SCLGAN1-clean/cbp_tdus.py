@@ -25,17 +25,17 @@ def get_cbp_tdus_config(dataset_name):
 
     if name == "houston":
         return _remember_cbp_tdus_config({
-            "query_ratio": 0.005,
-            "max_query": 224,
-            "min_conf_start": 0.98,
-            "min_conf_floor": 0.90,
-            "min_conf_decay": 0.002,
-            "min_agree": 1.0,
-            "quality_quantile": 0.75,
-            "min_selected": 64,
-            "min_coverage_ratio": 0.80,
-            "max_prior_thr": 0.55,
-            "prior_alpha": 0.5,
+            "query_ratio": 0.01,
+            "max_query": 256,
+            "min_conf_start": 0.90,
+            "min_conf_floor": 0.80,
+            "min_conf_decay": 0.003,
+            "min_agree": 0.5,
+            "quality_quantile": 0.50,
+            "min_selected": 32,
+            "min_coverage_ratio": 0.40,
+            "max_prior_thr": 0.75,
+            "prior_alpha": 0.3,
         })
 
     if name == "up2pc":

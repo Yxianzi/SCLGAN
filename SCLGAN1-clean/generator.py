@@ -251,3 +251,83 @@ class SSDGnet(nn.Module):
         out2 = self.Net2(x)
         #print("out1.shape,out2.shape",out1.shape,out2.shape)
         return out1, out2
+
+
+class ConservativeSpectralNet(nn.Module):
+    def __init__(self, args):
+        super(ConservativeSpectralNet, self).__init__()
+        ch = args.GIN_ch
+        self.gamma = float(getattr(args, "gen_gamma", 0.05))
+        self.Spectral_Weight_11 = Spectral_Weight(args.n_bands, ch, kernel_size=3, stride=1, padding=1)
+        self.Spectral_Weight_12 = Spectral_Weight(ch, ch, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(ch)
+        self.bn2 = nn.BatchNorm2d(ch)
+        self.activate = nn.LeakyReLU(0.2, inplace=True)
+        self.generate = nn.Conv2d(ch, args.n_bands, kernel_size=3, padding=1)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d)):
+                if hasattr(m, "weight") and m.weight is not None:
+                    nn.init.constant_(m.weight, 1.0)
+                if hasattr(m, "bias") and m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+
+    def forward(self, x):
+        out = self.Spectral_Weight_11(x)
+        out = self.activate(self.bn1(out))
+        out = self.Spectral_Weight_12(out)
+        out = self.activate(self.bn2(out))
+        delta = self.generate(out)
+        return x + self.gamma * torch.tanh(delta)
+
+
+class ConservativeSpatialNet(nn.Module):
+    def __init__(self, args):
+        super(ConservativeSpatialNet, self).__init__()
+        ch = args.GIN_ch
+        self.gamma = float(getattr(args, "gen_gamma", 0.05))
+        self.Spatial_Weight_21 = Spatial_Weight(args.n_bands, ch, kernel_size=3, stride=1, padding=1)
+        self.Spatial_Weight_22 = Spatial_Weight(ch, ch, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm2d(ch)
+        self.bn2 = nn.BatchNorm2d(ch)
+        self.activate = nn.LeakyReLU(0.2, inplace=True)
+        self.generate = nn.Conv2d(ch, args.n_bands, kernel_size=3, padding=1)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+            elif isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d)):
+                if hasattr(m, "weight") and m.weight is not None:
+                    nn.init.constant_(m.weight, 1.0)
+                if hasattr(m, "bias") and m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+
+    def forward(self, x):
+        out = self.Spatial_Weight_21(x)
+        out = self.activate(self.bn1(out))
+        out = self.Spatial_Weight_22(out)
+        out = self.activate(self.bn2(out))
+        delta = self.generate(out)
+        return x + self.gamma * torch.tanh(delta)
+
+
+class CSSGnet(nn.Module):
+    def __init__(self, args):
+        super(CSSGnet, self).__init__()
+        self.Net1 = ConservativeSpectralNet(args)
+        self.Net2 = ConservativeSpatialNet(args)
+
+    def forward(self, x):
+        x_spe = self.Net1(x)
+        x_spa = self.Net2(x)
+        return x_spe, x_spa
