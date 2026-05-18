@@ -65,8 +65,8 @@ group_model.add_argument('--tgccal_use_mean', type=int, default=1, help='use mea
 group_model.add_argument('--tgccal_use_proto', type=int, default=1, help='use prototype cosine in TG-CCAL')
 group_model.add_argument('--min_required_selected', type=int, default=CLASS_NUM * 4,
                          help='minimum core samples for full TG-CCAL weight')
-group_model.add_argument('--min_required_coverage', type=int, default=5)
-group_model.add_argument('--min_valid_classes', type=int, default=5)
+group_model.add_argument('--min_required_coverage', type=int, default=3)
+group_model.add_argument('--min_valid_classes', type=int, default=3)
 group_model.add_argument('--candidate_min_conf', type=float, default=0.80)
 group_model.add_argument('--candidate_max_entropy', type=float, default=0.80)
 group_model.add_argument('--candidate_top_ratio', type=float, default=0.20)
