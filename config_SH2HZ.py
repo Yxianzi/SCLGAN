@@ -2,10 +2,10 @@ nDataSet = 3
 
 BATCH_SIZE = 32
 epochs = 100
-lr = 0.01             #0.001
+lr = 0.0003             #0.001
 CLASS_NUM = 3
 nBand = 198
-HalfWidth =  1        #5
+HalfWidth =  0        #5
 train_num = 40
 
 momentum = 0.9
