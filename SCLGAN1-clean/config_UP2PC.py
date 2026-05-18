@@ -6,7 +6,7 @@ lr = 0.001
 CLASS_NUM = 7
 nBand = 102
 HalfWidth =  3   #4  5
-train_num = 50
+train_num = 30
 
 momentum = 0.9
 patch_size = 2 * HalfWidth + 1

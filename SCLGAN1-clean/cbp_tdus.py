@@ -40,33 +40,33 @@ def get_cbp_tdus_config(dataset_name):
 
     if name == "up2pc":
         return _remember_cbp_tdus_config({
-            "query_ratio": 0.006,
-            "max_query": 256,
-            "min_conf_start": 0.96,
-            "min_conf_floor": 0.86,
+            "query_ratio": 0.008,
+            "max_query": 320,
+            "min_conf_start": 0.94,
+            "min_conf_floor": 0.84,
             "min_conf_decay": 0.003,
             "min_agree": 0.5,
-            "quality_quantile": 0.70,
+            "quality_quantile": 0.60,
             "min_selected": 32,
             "min_coverage_ratio": 0.50,
-            "max_prior_thr": 0.60,
+            "max_prior_thr": 0.70,
             "min_class_count_abs": 2,
-            "prior_alpha": 0.2,
+            "prior_alpha": 0.3,
         })
 
     if name == "sh2hz":
         return _remember_cbp_tdus_config({
             "query_ratio": 0.008,
             "max_query": 384,
-            "min_conf_start": 0.95,
-            "min_conf_floor": 0.82,
+            "min_conf_start": 0.88,
+            "min_conf_floor": 0.75,
             "min_conf_decay": 0.004,
-            "min_agree": 1.0,
-            "quality_quantile": 0.70,
+            "min_agree": 0.5,
+            "quality_quantile": 0.60,
             "min_selected": 48,
             "min_coverage_ratio": 0.50,
-            "max_prior_thr": 0.65,
-            "prior_alpha": 0.5,
+            "max_prior_thr": 0.70,
+            "prior_alpha": 0.4,
         })
 
     return _remember_cbp_tdus_config({
@@ -373,6 +373,13 @@ def build_cbp_tdus_dataset(
     if generator_model is not None:
         generator_was_training = generator_model.training
         generator_model.eval()
+    use_classwise_score_threshold = True
+    class_score_thresholds = [0.0 for _ in range(num_classes)]
+
+    def _attach_class_score_threshold_info(info):
+        info["class_score_thresholds"] = [float(x) for x in class_score_thresholds]
+        info["use_classwise_score_threshold"] = bool(use_classwise_score_threshold)
+        return info
 
     prototypes_norm = F.normalize(source_prototypes.to(device).float(), dim=1)
 
@@ -523,6 +530,7 @@ def build_cbp_tdus_dataset(
             "spatial_status": "disabled_empty_target_loader",
             "skip_reason": "empty_target_loader",
         }
+        info = _attach_class_score_threshold_info(info)
         info = _attach_generation_info(info)
         info = _attach_candidate_info(
             info,
@@ -712,6 +720,7 @@ def build_cbp_tdus_dataset(
             "skip_reason": "prediction_collapse",
         }
 
+        info = _attach_class_score_threshold_info(info)
         info = _attach_generation_info(
             info,
             active_gen_reliability,
@@ -779,6 +788,7 @@ def build_cbp_tdus_dataset(
             "skip_reason": "no_candidate",
         }
 
+        info = _attach_class_score_threshold_info(info)
         info = _attach_generation_info(
             info,
             active_gen_reliability,
@@ -806,10 +816,24 @@ def build_cbp_tdus_dataset(
         )
         return TensorDataset(empty_data, empty_label, empty_weight), info
 
-    # Step 4: compute threshold only among valid candidates
-    score_threshold = float(torch.quantile(valid_scores, quality_quantile).item())
+    # Step 4: compute score threshold among valid candidates.
+    # Keep the global threshold for logging, while class-wise thresholds build the core pool.
+    score_threshold_tensor = torch.quantile(valid_scores, quality_quantile)
+    score_threshold = float(score_threshold_tensor.item())
 
-    core_pool_before_gen_gate = base_candidate_mask & (score_all >= score_threshold)
+    if use_classwise_score_threshold:
+        core_pool_before_gen_gate = torch.zeros_like(base_candidate_mask)
+        for class_id in range(num_classes):
+            cls_mask = base_candidate_mask & (pseudo_all == class_id)
+            cls_scores = score_all[cls_mask]
+            if cls_scores.numel() == 0:
+                class_score_thresholds[class_id] = 0.0
+                continue
+            cls_threshold = torch.quantile(cls_scores, quality_quantile)
+            class_score_thresholds[class_id] = float(cls_threshold.item())
+            core_pool_before_gen_gate |= cls_mask & (score_all >= cls_threshold)
+    else:
+        core_pool_before_gen_gate = base_candidate_mask & (score_all >= score_threshold)
     effective_gen_min_agreement = 1.0 if bool(gen_gate_strict) else float(gen_min_agreement)
     core_low_agree = int(
         (core_pool_before_gen_gate & (gen_agree_all < effective_gen_min_agreement)).sum().item()
@@ -895,6 +919,7 @@ def build_cbp_tdus_dataset(
             "spatial_status": spatial_status,
             "skip_reason": "no_selected_samples",
         }
+        info = _attach_class_score_threshold_info(info)
         info = _attach_generation_info(
             info,
             active_gen_reliability,
@@ -976,6 +1001,7 @@ def build_cbp_tdus_dataset(
             "spatial_status": spatial_status,
             "skip_reason": skip_reason,
         }
+        info = _attach_class_score_threshold_info(info)
         info = _attach_generation_info(
             info,
             active_gen_reliability,
@@ -1079,6 +1105,7 @@ def build_cbp_tdus_dataset(
         "soft_accept_weight_factor": float(soft_accept_weight_factor),
         "skip_reason": soft_accept_reason,
     }
+    info = _attach_class_score_threshold_info(info)
     info = _attach_generation_info(
         info,
         active_gen_reliability,
