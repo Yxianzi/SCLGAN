@@ -40,18 +40,18 @@ def get_cbp_tdus_config(dataset_name):
 
     if name == "up2pc":
         return _remember_cbp_tdus_config({
-            "query_ratio": 0.008,
-            "max_query": 320,
-            "min_conf_start": 0.94,
-            "min_conf_floor": 0.84,
-            "min_conf_decay": 0.003,
-            "min_agree": 0.5,
-            "quality_quantile": 0.60,
-            "min_selected": 32,
+            "query_ratio": 0.003,
+            "max_query": 96,
+            "min_conf_start": 0.97,
+            "min_conf_floor": 0.90,
+            "min_conf_decay": 0.002,
+            "min_agree": 1.0,
+            "quality_quantile": 0.75,
+            "min_selected": 16,
             "min_coverage_ratio": 0.50,
             "max_prior_thr": 0.70,
-            "min_class_count_abs": 2,
-            "prior_alpha": 0.3,
+            "min_class_count_abs": 1,
+            "prior_alpha": 0.2,
         })
 
     if name == "sh2hz":

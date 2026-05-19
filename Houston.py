@@ -100,6 +100,8 @@ group_model.add_argument('--lambda_candidate_gen_cons', type=float, default=0.00
 group_model.add_argument('--candidate_gen_cons_max_loss', type=float, default=2.0)
 group_model.add_argument('--use_reliability_tce', type=int, default=1)
 group_model.add_argument('--lambda_tgt_ce', type=float, default=0.05)
+group_model.add_argument('--lambda_tgt_cons', type=float, default=0.0,
+                         help='weight for target teacher-student consistency loss used with TDUS')
 group_model.add_argument('--verbose_tdus_log', type=int, default=1)
 
 args = parser.parse_args()
@@ -524,6 +526,9 @@ for iDataSet in range(nDataSet):
         tgt_ce_epoch_weighted = 0.0
         tgt_ce_epoch_count = 0
         tgt_ce_epoch_steps = 0
+        tgt_cons_epoch_raw = 0.0
+        tgt_cons_epoch_weighted = 0.0
+        tgt_cons_epoch_steps = 0
 
         for i in range(1, num_iter):
             source_data01, source_label = next(iter_source)
@@ -833,7 +838,11 @@ for iDataSet in range(nDataSet):
                     tgt_ce_epoch_weighted += tgt_ce_weighted.item()
                     tgt_ce_epoch_count += clean_data.size(0)
                     tgt_ce_epoch_steps += 1
-                    test_loss = tgt_ce_weighted + 0.1 * loss_cons
+                    tgt_cons_weighted = args.lambda_tgt_cons * loss_cons
+                    tgt_cons_epoch_raw += loss_cons.item()
+                    tgt_cons_epoch_weighted += tgt_cons_weighted.item()
+                    tgt_cons_epoch_steps += 1
+                    test_loss = tgt_ce_weighted + tgt_cons_weighted
 
                 if use_candidate_consistency and not candidate_skip_epoch:
                     if i % len_candidate_loader == 0:
@@ -1015,6 +1024,14 @@ for iDataSet in range(nDataSet):
                     tgt_ce_epoch_count,
                     tgt_ce_avg_raw,
                     tgt_ce_avg_weighted,
+                )
+            )
+            print(
+                "[TGT-CONS] raw={:.6f}, weighted={:.6f}, weight={:.6f}, steps={}".format(
+                    tgt_cons_epoch_raw / max(1, tgt_cons_epoch_steps),
+                    tgt_cons_epoch_weighted / max(1, tgt_cons_epoch_steps),
+                    args.lambda_tgt_cons,
+                    tgt_cons_epoch_steps,
                 )
             )
             candidate_gen_avg_loss = candidate_gen_epoch_loss / max(1, candidate_gen_epoch_steps)
