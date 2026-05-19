@@ -1,0 +1,19 @@
+nDataSet = 10
+BATCH_SIZE = 32
+epochs = 100
+lr = 0.001
+CLASS_NUM = 3
+nBand = 198
+HalfWidth = 0
+train_num=40
+alpha = 1.0
+smoothness=0.1
+momentum = 0.9
+patch_size = 2 * HalfWidth + 1
+no_cuda =False
+cuda_id = '0'
+l2_decay = 5e-4
+seeds = [1236, 1437, 1211, 1000, 1153, 1535, 1066, 2876, 2639,1628]
+train_end = 0
+test_end = 0
+

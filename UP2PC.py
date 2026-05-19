@@ -51,6 +51,12 @@ group_model.add_argument('--gen_preserve_weight', type=float, default=0.01)
 group_model.add_argument('--gen_sam_weight', type=float, default=0.1)
 group_model.add_argument('--gen_lr_ratio', type=float, default=0.1,
                          help='learning rate ratio for generator relative to feature encoder')
+group_model.add_argument('--gen_stop_epoch', type=int, default=10,
+                         help='stop updating CSSG after this epoch; <=0 keeps training it')
+group_model.add_argument('--freeze_gen_after_stop', type=int, default=1,
+                         help='freeze generator parameters after gen_stop_epoch')
+group_model.add_argument('--detach_gen_aug', type=int, default=1,
+                         help='detach generated augmentations before feeding them to feature_encoder')
 group_model.add_argument('--use_tdus', action='store_true', default=False, help='enable TDUS pseudo-label training')
 group_model.add_argument('--align_type', type=str, default='none',
                          choices=['none', 'global_cal', 'tg_ccal'],
@@ -181,6 +187,17 @@ def sam_loss(x, y, eps=1e-6):
     return torch.acos(cos).mean()
 
 
+def set_requires_grad(model, requires_grad):
+    for p in model.parameters():
+        p.requires_grad_(requires_grad)
+
+
+def should_train_generator(epoch, args):
+    if int(args.gen_stop_epoch) <= 0:
+        return True
+    return epoch <= int(args.gen_stop_epoch)
+
+
 def class_prototype_covariance_alignment(
         source_features,
         source_labels,
@@ -307,6 +324,7 @@ for iDataSet in range(nDataSet):
     }
 
     for epoch in range(1, epochs + 1):
+        train_generator = should_train_generator(epoch, args)
         LEARNING_RATE = lr / math.pow((1 + 10 * (epoch - 1) / epochs), 0.75)
         for param_group in optimizer.param_groups:
             if param_group.get("name", "") == "generator":
@@ -320,7 +338,13 @@ for iDataSet in range(nDataSet):
         cls_criterion = torch.nn.CrossEntropyLoss()
 
         feature_encoder.train()
-        G_net.train()
+        if train_generator:
+            set_requires_grad(G_net, True)
+            G_net.train()
+        else:
+            if bool(args.freeze_gen_after_stop):
+                set_requires_grad(G_net, False)
+            G_net.eval()
         iter_source = iter(train_loader_s)
         iter_target = iter(train_loader_t)
 
@@ -534,8 +558,13 @@ for iDataSet in range(nDataSet):
             if i % len_target_loader == 0:
                 iter_target = iter(train_loader_t)
 
-            source_aug_img1, source_aug_img2 = G_net(source_data00)
-            target_aug_img1, target_aug_img2 = G_net(target_data00)
+            if train_generator:
+                source_aug_img1, source_aug_img2 = G_net(source_data00)
+                target_aug_img1, target_aug_img2 = G_net(target_data00)
+            else:
+                with torch.no_grad():
+                    source_aug_img1, source_aug_img2 = G_net(source_data00)
+                    target_aug_img1, target_aug_img2 = G_net(target_data00)
             loss_gen_rec = (
                 F.l1_loss(source_aug_img1, source_data00)
                 + F.l1_loss(source_aug_img2, source_data00)
@@ -553,13 +582,28 @@ for iDataSet in range(nDataSet):
             source_data = alpha1 * source_aug_img1 + alpha2 * source_aug_img2 + alpha3 * source_data00
             target_data = alpha1 * target_aug_img1 + alpha2 * target_aug_img2 + alpha3 * target_data00
 
-            _, _, _, predict1, _ = feature_encoder(source_aug_img1.detach())
-            _, _, _, predict2, _ = feature_encoder(source_aug_img2.detach())
-            _, _, _, predict3, _ = feature_encoder(source_data.detach())
+            if bool(args.detach_gen_aug):
+                source_aug_img1_for_encoder = source_aug_img1.detach()
+                source_aug_img2_for_encoder = source_aug_img2.detach()
+                target_aug_img1_for_encoder = target_aug_img1.detach()
+                target_aug_img2_for_encoder = target_aug_img2.detach()
+                source_data_for_encoder = source_data.detach()
+                target_data_for_encoder = target_data.detach()
+            else:
+                source_aug_img1_for_encoder = source_aug_img1
+                source_aug_img2_for_encoder = source_aug_img2
+                target_aug_img1_for_encoder = target_aug_img1
+                target_aug_img2_for_encoder = target_aug_img2
+                source_data_for_encoder = source_data
+                target_data_for_encoder = target_data
 
-            _, _, _, predict4, _ = feature_encoder(target_aug_img1.detach())
-            _, _, _, predict5, _ = feature_encoder(target_aug_img2.detach())
-            _, _, _, predict6, _ = feature_encoder(target_data.detach())
+            _, _, _, predict1, _ = feature_encoder(source_aug_img1_for_encoder)
+            _, _, _, predict2, _ = feature_encoder(source_aug_img2_for_encoder)
+            _, _, _, predict3, _ = feature_encoder(source_data_for_encoder)
+
+            _, _, _, predict4, _ = feature_encoder(target_aug_img1_for_encoder)
+            _, _, _, predict5, _ = feature_encoder(target_aug_img2_for_encoder)
+            _, _, _, predict6, _ = feature_encoder(target_data_for_encoder)
 
             loss_aug1 = cls_criterion(predict1, source_label.long())
             loss_aug2 = cls_criterion(predict2, source_label.long())
@@ -578,12 +622,12 @@ for iDataSet in range(nDataSet):
             prob6 = torch.softmax(predict6, dim=1)
 
             source_features, source1, _, source_outputs, source_out = feature_encoder(source_data01.cuda())
-            _, source2, _, _, _ = feature_encoder(source_aug_img1.cuda())
-            _, source3, _, _, _ = feature_encoder(source_aug_img2.cuda())
+            _, source2, _, _, _ = feature_encoder(source_aug_img1_for_encoder)
+            _, source3, _, _, _ = feature_encoder(source_aug_img2_for_encoder)
 
             target_features, target1, _, target_outputs, target_out = feature_encoder(target_data01.cuda())
-            _, _, target2, t1, _ = feature_encoder(target_aug_img1.cuda())
-            _, _, target3, t2, _ = feature_encoder(target_aug_img2.cuda())
+            _, _, target2, t1, _ = feature_encoder(target_aug_img1_for_encoder)
+            _, _, target3, t2, _ = feature_encoder(target_aug_img2_for_encoder)
 
             if USE_DBR:
                 loss_dbr, dbr_ent, dbr_bal, target_prob = distribution_balance_regularization(
@@ -752,7 +796,10 @@ for iDataSet in range(nDataSet):
             cpc_weight = lambda_cpc * cpc_progress if (USE_CPC or USE_PPA) else 0.0
             weighted_con_s = args.lambda_con_s * contrastive_loss_s
             weighted_con_t = args.lambda_con_t * contrastive_loss_t
-            weighted_gen_preserve = args.gen_preserve_weight * loss_gen_preserve
+            if train_generator:
+                weighted_gen_preserve = args.gen_preserve_weight * loss_gen_preserve
+            else:
+                weighted_gen_preserve = loss_gen_preserve.detach().new_tensor(0.0)
             loss = (
                 cls_loss
                 + 0.01 * lambd * lmmd_loss
@@ -887,6 +934,9 @@ for iDataSet in range(nDataSet):
             total_batch_loss = loss + test_loss if test_loss is not None else loss
             optimizer.zero_grad()
             total_batch_loss.backward()
+            if not train_generator:
+                for p in G_net.parameters():
+                    p.grad = None
             optimizer.step()
             teacher_encoder.update(feature_encoder)
 
