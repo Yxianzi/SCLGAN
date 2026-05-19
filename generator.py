@@ -6,6 +6,13 @@ from torch.nn import init
 from involution import involution
 
 
+def make_norm(num_channels):
+    for groups in (8, 4, 2, 1):
+        if num_channels % groups == 0:
+            return nn.GroupNorm(groups, num_channels)
+    return nn.GroupNorm(1, num_channels)
+
+
 class Spectral_Weight(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=1, dilation=1, groups=1, bias=False):
         super(Spectral_Weight, self).__init__()
@@ -258,13 +265,18 @@ class ConservativeSpectralNet(nn.Module):
         super(ConservativeSpectralNet, self).__init__()
         ch = args.GIN_ch
         self.gamma = float(getattr(args, "gen_gamma", 0.05))
+        self.last_delta_abs_mean = 0.0
+        self.last_delta_abs_max = 0.0
         self.Spectral_Weight_11 = Spectral_Weight(args.n_bands, ch, kernel_size=3, stride=1, padding=1)
         self.Spectral_Weight_12 = Spectral_Weight(ch, ch, kernel_size=3, stride=1, padding=1)
-        self.bn1 = nn.BatchNorm2d(ch)
-        self.bn2 = nn.BatchNorm2d(ch)
+        self.bn1 = make_norm(ch)
+        self.bn2 = make_norm(ch)
         self.activate = nn.LeakyReLU(0.2, inplace=True)
         self.generate = nn.Conv2d(ch, args.n_bands, kernel_size=3, padding=1)
         self._init_weights()
+
+    def set_gamma(self, gamma):
+        self.gamma = float(gamma)
 
     def _init_weights(self):
         for m in self.modules():
@@ -272,7 +284,7 @@ class ConservativeSpectralNet(nn.Module):
                 nn.init.normal_(m.weight, mean=0.0, std=0.02)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
-            elif isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d)):
+            elif isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d, nn.GroupNorm)):
                 if hasattr(m, "weight") and m.weight is not None:
                     nn.init.constant_(m.weight, 1.0)
                 if hasattr(m, "bias") and m.bias is not None:
@@ -284,6 +296,8 @@ class ConservativeSpectralNet(nn.Module):
         out = self.Spectral_Weight_12(out)
         out = self.activate(self.bn2(out))
         delta = self.generate(out)
+        self.last_delta_abs_mean = delta.detach().abs().mean().item()
+        self.last_delta_abs_max = delta.detach().abs().max().item()
         return x + self.gamma * torch.tanh(delta)
 
 
@@ -292,13 +306,18 @@ class ConservativeSpatialNet(nn.Module):
         super(ConservativeSpatialNet, self).__init__()
         ch = args.GIN_ch
         self.gamma = float(getattr(args, "gen_gamma", 0.05))
+        self.last_delta_abs_mean = 0.0
+        self.last_delta_abs_max = 0.0
         self.Spatial_Weight_21 = Spatial_Weight(args.n_bands, ch, kernel_size=3, stride=1, padding=1)
         self.Spatial_Weight_22 = Spatial_Weight(ch, ch, kernel_size=3, stride=1, padding=1)
-        self.bn1 = nn.BatchNorm2d(ch)
-        self.bn2 = nn.BatchNorm2d(ch)
+        self.bn1 = make_norm(ch)
+        self.bn2 = make_norm(ch)
         self.activate = nn.LeakyReLU(0.2, inplace=True)
         self.generate = nn.Conv2d(ch, args.n_bands, kernel_size=3, padding=1)
         self._init_weights()
+
+    def set_gamma(self, gamma):
+        self.gamma = float(gamma)
 
     def _init_weights(self):
         for m in self.modules():
@@ -306,7 +325,7 @@ class ConservativeSpatialNet(nn.Module):
                 nn.init.normal_(m.weight, mean=0.0, std=0.02)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.0)
-            elif isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d)):
+            elif isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d, nn.GroupNorm)):
                 if hasattr(m, "weight") and m.weight is not None:
                     nn.init.constant_(m.weight, 1.0)
                 if hasattr(m, "bias") and m.bias is not None:
@@ -318,6 +337,8 @@ class ConservativeSpatialNet(nn.Module):
         out = self.Spatial_Weight_22(out)
         out = self.activate(self.bn2(out))
         delta = self.generate(out)
+        self.last_delta_abs_mean = delta.detach().abs().mean().item()
+        self.last_delta_abs_max = delta.detach().abs().max().item()
         return x + self.gamma * torch.tanh(delta)
 
 
@@ -326,6 +347,10 @@ class CSSGnet(nn.Module):
         super(CSSGnet, self).__init__()
         self.Net1 = ConservativeSpectralNet(args)
         self.Net2 = ConservativeSpatialNet(args)
+
+    def set_gamma(self, gamma):
+        self.Net1.set_gamma(gamma)
+        self.Net2.set_gamma(gamma)
 
     def forward(self, x):
         x_spe = self.Net1(x)

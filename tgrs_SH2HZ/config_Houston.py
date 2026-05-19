@@ -7,17 +7,13 @@ CLASS_NUM = 7
 nBand = 48
 HalfWidth = 3
 train_num = 40
-
+alpha = 1.0
+smoothness = 0.1
 momentum = 0.9
 patch_size = 2 * HalfWidth + 1
-no_cuda =False
+no_cuda = False
 cuda_id = '0'
 l2_decay = 1e-6
-
 seeds = [1372, 1328, 1417, 1421, 1535, 1535, 1588, 1610, 1631, 1670]
-
 train_end = 0
 test_end = 0
-
-GIN_ch=24
-temp=0.7

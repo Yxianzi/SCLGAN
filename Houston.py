@@ -48,10 +48,16 @@ group_model.add_argument('--GIN_ch', type=int, default=24, help='channel of GIN'
 group_model.add_argument('--n_bands', type=int, default=48)
 group_model.add_argument('--gen_type', type=str, default='cssg', choices=['original', 'cssg'])
 group_model.add_argument('--gen_gamma', type=float, default=0.05)
+group_model.add_argument('--gen_gamma_start', type=float, default=0.02)
+group_model.add_argument('--gen_gamma_end', type=float, default=0.12)
+group_model.add_argument('--gen_gamma_warmup', type=int, default=50)
 group_model.add_argument('--gen_preserve_weight', type=float, default=0.01)
+group_model.add_argument('--gen_preserve_warmup', type=int, default=30)
 group_model.add_argument('--gen_sam_weight', type=float, default=0.1)
+group_model.add_argument('--gen_semantic_weight', type=float, default=0.1)
 group_model.add_argument('--gen_lr_ratio', type=float, default=0.1,
                          help='learning rate ratio for generator relative to feature encoder')
+group_model.add_argument('--debug_gen_grad', type=int, default=1)
 group_model.add_argument('--use_tdus', action='store_true', default=False, help='enable TDUS pseudo-label training')
 group_model.add_argument('--align_type', type=str, default='none',
                          choices=['none', 'global_cal', 'tg_ccal'],
@@ -329,8 +335,12 @@ for iDataSet in range(nDataSet):
                 param_group["lr"] = LEARNING_RATE * args.gen_lr_ratio
             else:
                 param_group["lr"] = LEARNING_RATE
-        print('learning rate feature={:.6f}, generator={:.6f}'.format(
-            LEARNING_RATE, LEARNING_RATE * args.gen_lr_ratio
+        progress = min(max((epoch - 1) / max(args.gen_gamma_warmup, 1), 0.0), 1.0)
+        current_gen_gamma = args.gen_gamma_start + progress * (args.gen_gamma_end - args.gen_gamma_start)
+        if hasattr(G_net, "set_gamma"):
+            G_net.set_gamma(current_gen_gamma)
+        print('learning rate feature={:.6f}, generator={:.6f}, gen_gamma={:.6f}'.format(
+            LEARNING_RATE, LEARNING_RATE * args.gen_lr_ratio, current_gen_gamma
         ))
         tdus_refreshed = False
         cls_criterion = torch.nn.CrossEntropyLoss()
@@ -529,6 +539,12 @@ for iDataSet in range(nDataSet):
         tgt_cons_epoch_raw = 0.0
         tgt_cons_epoch_weighted = 0.0
         tgt_cons_epoch_steps = 0
+        gen_grad_norm = 0.0
+        gen_grad_count = 0
+        loss_gen_semantic = torch.zeros((), device=device)
+        weighted_gen_semantic = torch.zeros((), device=device)
+        effective_gen_preserve_weight = 0.0
+        weighted_gen_preserve = torch.zeros((), device=device)
 
         for i in range(1, num_iter):
             source_data01, source_label = next(iter_source)
@@ -568,6 +584,9 @@ for iDataSet in range(nDataSet):
             _, _, _, predict1, _ = feature_encoder(source_aug_img1.detach())
             _, _, _, predict2, _ = feature_encoder(source_aug_img2.detach())
             _, _, _, predict3, _ = feature_encoder(source_data.detach())
+            _, _, _, predict1_g, _ = feature_encoder(source_aug_img1)
+            _, _, _, predict2_g, _ = feature_encoder(source_aug_img2)
+            _, _, _, predict3_g, _ = feature_encoder(source_data)
 
             _, _, _, predict4, _ = feature_encoder(target_aug_img1.detach())
             _, _, _, predict5, _ = feature_encoder(target_aug_img2.detach())
@@ -576,6 +595,11 @@ for iDataSet in range(nDataSet):
             loss_aug1 = cls_criterion(predict1, source_label.long())
             loss_aug2 = cls_criterion(predict2, source_label.long())
             loss_aug3 = cls_criterion(predict3, source_label.long())
+            loss_gen_semantic = (
+                cls_criterion(predict1_g, source_label.long())
+                + cls_criterion(predict2_g, source_label.long())
+                + cls_criterion(predict3_g, source_label.long())
+            ) / 3.0
 
             loss_aug4 = torch.zeros((), device=target_data00.device)
             loss_aug5 = torch.zeros((), device=target_data00.device)
@@ -767,7 +791,10 @@ for iDataSet in range(nDataSet):
             cpc_weight = lambda_cpc * cpc_progress if (USE_CPC or USE_PPA) else 0.0
             weighted_con_s = args.lambda_con_s * contrastive_loss_s
             weighted_con_t = args.lambda_con_t * contrastive_loss_t
-            weighted_gen_preserve = args.gen_preserve_weight * loss_gen_preserve
+            preserve_progress = min(max((epoch - 1) / max(args.gen_preserve_warmup, 1), 0.0), 1.0)
+            effective_gen_preserve_weight = args.gen_preserve_weight * preserve_progress
+            weighted_gen_preserve = effective_gen_preserve_weight * loss_gen_preserve
+            weighted_gen_semantic = args.gen_semantic_weight * loss_gen_semantic
             loss = (
                 cls_loss
                 + 0.01 * lambd * lmmd_loss
@@ -777,6 +804,7 @@ for iDataSet in range(nDataSet):
                 + loss_correlation_alignment_loss
                 + loss_min
                 + weighted_gen_preserve
+                + weighted_gen_semantic
             )
             # print(loss)
             epoch_dbr_ent += dbr_ent.item()
@@ -899,6 +927,13 @@ for iDataSet in range(nDataSet):
             total_batch_loss = loss + test_loss if test_loss is not None else loss
             optimizer.zero_grad()
             total_batch_loss.backward()
+            if bool(args.debug_gen_grad):
+                gen_grad_norm = 0.0
+                gen_grad_count = 0
+                for p in G_net.parameters():
+                    if p.grad is not None:
+                        gen_grad_norm += p.grad.detach().norm(2).item()
+                        gen_grad_count += 1
             optimizer.step()
             teacher_encoder.update(feature_encoder)
 
@@ -907,20 +942,35 @@ for iDataSet in range(nDataSet):
                 .format(epoch, cls_loss.item(), lmmd_loss.item(), domain_similar_loss.item(), contrastive_loss_s.item(),
                         contrastive_loss_t.item(),
                         total_hit / size,  loss_min.item(),loss_correlation_alignment_loss.item(), loss.item()))
+        with torch.no_grad():
+            delta_spe = torch.mean(torch.abs(source_aug_img1 - source_data00)).item()
+            delta_spa = torch.mean(torch.abs(source_aug_img2 - source_data00)).item()
         print(
-            "[GEN-PRESERVE] type={}, gamma={:.4f}, rec={:.6f}, sam={:.6f}, preserve={:.6f}, weighted={:.6f}".format(
-                args.gen_type,
-                args.gen_gamma,
-                loss_gen_rec.item(),
-                loss_gen_sam.item(),
+            "[GEN-OPT] gamma={:.6f}, preserve_weight={:.6f}, semantic_weight={:.6f}, gen_grad_norm={:.6f}, gen_grad_count={}".format(
+                current_gen_gamma,
+                effective_gen_preserve_weight,
+                args.gen_semantic_weight,
+                gen_grad_norm,
+                gen_grad_count,
+            )
+        )
+        print(
+            "[GEN-DELTA] spe={:.6f}, spa={:.6f}, net1_delta_mean={:.6f}, net2_delta_mean={:.6f}, net1_delta_max={:.6f}, net2_delta_max={:.6f}".format(
+                delta_spe,
+                delta_spa,
+                getattr(getattr(G_net, "Net1", None), "last_delta_abs_mean", 0.0),
+                getattr(getattr(G_net, "Net2", None), "last_delta_abs_mean", 0.0),
+                getattr(getattr(G_net, "Net1", None), "last_delta_abs_max", 0.0),
+                getattr(getattr(G_net, "Net2", None), "last_delta_abs_max", 0.0),
+            )
+        )
+        print(
+            "[GEN-LOSS] semantic={:.6f}, preserve={:.6f}, preserve_weighted={:.6f}".format(
+                loss_gen_semantic.item(),
                 loss_gen_preserve.item(),
                 weighted_gen_preserve.item(),
             )
         )
-        with torch.no_grad():
-            delta_spe = torch.mean(torch.abs(source_aug_img1 - source_data00)).item()
-            delta_spa = torch.mean(torch.abs(source_aug_img2 - source_data00)).item()
-        print("[GEN-DELTA] spe={:.6f}, spa={:.6f}".format(delta_spe, delta_spa))
         if tdus_refreshed and bool(args.verbose_tdus_log):
             print(
                 "[CON] raw_s={:.6f}, raw_t={:.6f}, lambda_s={:.4f}, lambda_t={:.4f}, weighted_s={:.6f}, weighted_t={:.6f}".format(

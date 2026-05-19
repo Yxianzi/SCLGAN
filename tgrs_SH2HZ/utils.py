@@ -13,7 +13,10 @@ from sklearn.manifold import TSNE
 from sklearn.cluster import KMeans
 import h5py
 import numpy as np
-import seaborn as sns
+try:
+    import seaborn as sns
+except ImportError:
+    sns = None
 
 from sklearn import preprocessing
 from sklearn.metrics import pairwise_distances
@@ -1418,6 +1421,40 @@ def flip_augmentation(data, flip_prob=0.3):
         data_np = np.roll(data_np, shift=shift_pixels, axis=axis)
 
     return torch.from_numpy(data_np.copy()) if return_tensor else data_np
+
+
+def flip_augmentation(data, flip_prob=0.3):
+    """Apply mild spatial augmentation on the last two dimensions."""
+    if isinstance(data, torch.Tensor):
+        out = data
+        if np.random.random() < flip_prob:
+            mode = np.random.choice(['hflip', 'vflip', 'none'], p=[0.4, 0.4, 0.2])
+            if mode == 'hflip':
+                out = torch.flip(out, dims=[-1])
+            elif mode == 'vflip':
+                out = torch.flip(out, dims=[-2])
+
+        if np.random.random() < 0.5 and out.dim() >= 2:
+            shift_pixels = int(np.random.randint(0, 2))
+            axis = int(np.random.choice([-2, -1]))
+            out = torch.roll(out, shifts=shift_pixels, dims=axis)
+
+        return out
+
+    data_np = data.copy()
+    if np.random.random() < flip_prob:
+        mode = np.random.choice(['hflip', 'vflip', 'none'], p=[0.4, 0.4, 0.2])
+        if mode == 'hflip':
+            data_np = np.flip(data_np, axis=-1)
+        elif mode == 'vflip':
+            data_np = np.flip(data_np, axis=-2)
+
+    if np.random.random() < 0.5 and data_np.ndim >= 2:
+        shift_pixels = int(np.random.randint(0, 2))
+        axis = int(np.random.choice([-2, -1]))
+        data_np = np.roll(data_np, shift=shift_pixels, axis=axis)
+
+    return data_np.copy()
 
 def wasserstein_distance(source, target, reg=1e-3, num_iter=100):
     """
